@@ -10,16 +10,6 @@ const DEFAULT_UNCLAIMED_CLAIM_PERIOD_SECONDS: u64 = 90 * 24 * 60 * 60;
 const RECOVERY_TTL_LEDGERS: u32 = 365 * 17_280;
 const RECOVERY_LIFETIME_THRESHOLD: u32 = 31 * 17_280;
 
-/// Maximum completed recovery records retained per market.
-///
-/// Bounds persistent storage growth under repeated recovery events. Active
-/// (unresolved) recovery state is stored separately and is never counted toward
-/// this cap.
-pub const MAX_RECOVERY_HISTORY_PER_MARKET: u32 = 10;
-
-/// Maximum entries removable in a single admin prune call (gas safety).
-pub const MAX_RECOVERY_PRUNE_BATCH: u32 = 30;
-
 // ===== PER-MARKET RECOVERY TIMELOCK =====
 
 /// Default timelock delay before a per-market recovery action can be executed (24 hours).
@@ -372,19 +362,12 @@ impl RecoveryStorage {
         }
     }
 
-    fn trim_history(env: &Env, history: &mut Vec<RecoveryHistoryEntry>) {
-        while history.len() > MAX_RECOVERY_HISTORY_PER_MARKET {
-            history.remove(0);
-        }
-    }
-
     fn append_history_entry(env: &Env, market_id: &Symbol, record: &MarketRecovery) {
         let mut history = Self::load_history_direct(env, market_id);
         history.push_back(RecoveryHistoryEntry {
             record: record.clone(),
             recorded_at: env.ledger().timestamp(),
         });
-        Self::trim_history(env, &mut history);
         Self::save_history(env, market_id, &history);
     }
 
@@ -457,14 +440,16 @@ impl RecoveryStorage {
         status_map.get(market_id.clone())
     }
 
-    /// Remove the oldest `count` completed recovery records for a market (admin only).
+    /// Reject attempts to remove completed recovery records.
     ///
-    /// Never removes the active (unresolved) recovery entry for the market.
+    /// Recovery history is an append-only audit trail. This entrypoint remains
+    /// for compatibility with clients that may still reference it, but it can
+    /// no longer delete historical records.
     pub fn prune_history(
         env: &Env,
         admin: &Address,
-        market_id: &Symbol,
-        count: u32,
+        _market_id: &Symbol,
+        _count: u32,
     ) -> Result<u32, Error> {
         admin.require_auth();
 
@@ -478,20 +463,7 @@ impl RecoveryStorage {
             return Err(Error::Unauthorized);
         }
 
-        let count = core::cmp::min(count, MAX_RECOVERY_PRUNE_BATCH);
-        let mut history = Self::load_history(env, market_id);
-        if history.is_empty() || count == 0 {
-            return Ok(0);
-        }
-
-        let mut removed = 0u32;
-        while removed < count && history.len() > 0 {
-            history.remove(0);
-            removed += 1;
-        }
-
-        Self::save_history(env, market_id, &history);
-        Ok(removed)
+        Err(Error::InvalidState)
     }
 }
 
@@ -1339,19 +1311,18 @@ mod tests {
     }
 
     #[test]
-    fn test_recovery_history_capped_per_market() {
+    fn test_recovery_history_is_append_only() {
         let env = Env::default();
         let market_id = Symbol::new(&env, "m_cap");
         let mut history = Vec::new(&env);
-        let writes = MAX_RECOVERY_HISTORY_PER_MARKET as usize + 5;
+        let writes = 15;
         for _ in 0..writes {
             history.push_back(RecoveryHistoryEntry {
                 record: completed_record_minimal(&env, &market_id),
                 recorded_at: 0,
             });
         }
-        RecoveryStorage::trim_history(&env, &mut history);
-        assert_eq!(history.len(), MAX_RECOVERY_HISTORY_PER_MARKET);
+        assert_eq!(history.len(), writes as u32);
 
         let (env, _admin, contract_id, market_id) = setup_admin_env();
         env.as_contract(&contract_id, || {
@@ -1364,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_preserves_active_recovery() {
+    fn test_prune_history_is_rejected_without_deleting() {
         let (env, admin, contract_id, market_id) = setup_admin_env();
         env.as_contract(&contract_id, || {
             for i in 0..5 {
@@ -1376,22 +1347,11 @@ mod tests {
             RecoveryStorage::save(&env, &pending_record(&env, &market_id));
             assert_eq!(RecoveryStorage::history_len(&env, &market_id), 5);
 
-            let removed = RecoveryStorage::prune_history(&env, &admin, &market_id, 3).unwrap();
-            assert_eq!(removed, 3);
-            assert_eq!(RecoveryStorage::history_len(&env, &market_id), 2);
+            let result = RecoveryStorage::prune_history(&env, &admin, &market_id, 3);
+            assert_eq!(result, Err(Error::InvalidState));
+            assert_eq!(RecoveryStorage::history_len(&env, &market_id), 5);
             let active = RecoveryStorage::load_active(&env, &market_id).expect("active kept");
             assert!(!active.recovered);
-        });
-    }
-
-    #[test]
-    fn test_prune_count_greater_than_stored() {
-        let (env, admin, contract_id, market_id) = setup_admin_env();
-        env.as_contract(&contract_id, || {
-            RecoveryStorage::save(&env, &completed_record(&env, &market_id, "only"));
-            let removed = RecoveryStorage::prune_history(&env, &admin, &market_id, 100).unwrap();
-            assert_eq!(removed, 1);
-            assert_eq!(RecoveryStorage::history_len(&env, &market_id), 0);
         });
     }
 
