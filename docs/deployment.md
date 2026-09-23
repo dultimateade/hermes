@@ -23,3 +23,21 @@ funded on the selected network before deployment.
 This workflow deploys the WASM only. Contract-specific initialization, if
 required by a future contract, should be run as an explicit follow-up command
 using the returned contract ID.
+
+## Verify staging and production
+
+After deploying the same commit to both environments, compare the deployed
+WASM binaries with:
+
+```bash
+make verify-contract-sync \
+	CONTRACT=markets \
+	STAGING_CONTRACT_ID=C... \
+	PRODUCTION_CONTRACT_ID=C... \
+	STAGING_NETWORK=testnet \
+	PRODUCTION_NETWORK=mainnet
+```
+
+The command builds the selected package once, fetches both deployed WASMs with
+the Stellar CLI, and fails if either SHA-256 hash differs from the local build.
+It requires configured CLI network and identity settings for both networks.
