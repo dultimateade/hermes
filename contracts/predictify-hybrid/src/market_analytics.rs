@@ -788,53 +788,41 @@ fn min_stake_index(heap: &soroban_sdk::Vec<MarketLeaderboardEntry>) -> u32 {
     min_idx
 }
 
-/// Sort a copy of `heap` descending by stake, assign ranks, and cap at `limit`.
-///
-/// Uses insertion sort (O(N²)) which is acceptable for N ≤ 50.
+/// Select and sort the best `limit` entries, assign ranks, and cap the result.
 fn sort_descending_by_stake(
     env: &Env,
     heap: soroban_sdk::Vec<MarketLeaderboardEntry>,
     limit: u32,
 ) -> soroban_sdk::Vec<MarketLeaderboardEntry> {
-    let mut sorted: soroban_sdk::Vec<MarketLeaderboardEntry> = soroban_sdk::Vec::new(env);
+    let take = limit.min(heap.len());
+    let mut sorted: alloc::vec::Vec<MarketLeaderboardEntry> = alloc::vec::Vec::new();
     for i in 0..heap.len() {
-        sorted.push_back(heap.get(i).unwrap());
+        sorted.push(heap.get(i).unwrap());
     }
 
-    // Insertion sort: descending by stake, then ascending by timestamp (tie-break).
-    let n = sorted.len();
-    for i in 1..n {
-        let mut j = i;
-        while j > 0 {
-            let a = sorted.get(j - 1).unwrap();
-            let b = sorted.get(j).unwrap();
-
-            // `a` should come before `b` when a.stake > b.stake, or equal
-            // stake with earlier timestamp (first-bettor advantage).
-            let a_first = a.stake > b.stake
-                || (a.stake == b.stake && a.last_bet_timestamp <= b.last_bet_timestamp);
-
-            if a_first {
-                break; // already in order
-            }
-            // swap j-1 and j
-            sorted.remove(j - 1);
-            sorted.insert(j - 1, b);
-            sorted.remove(j);
-            sorted.insert(j, a);
-            j -= 1;
-        }
+    if take < sorted.len() {
+        // Partition around the boundary so only the requested prefix needs sorting.
+        sorted.select_nth_unstable_by(take as usize, compare_leaderboard_entries);
     }
+    sorted[..take as usize].sort_unstable_by(compare_leaderboard_entries);
 
-    // Trim to limit and assign 1-indexed ranks.
-    let take = limit.min(sorted.len());
     let mut result: soroban_sdk::Vec<MarketLeaderboardEntry> = soroban_sdk::Vec::new(env);
     for i in 0..take {
-        let mut entry = sorted.get(i).unwrap();
+        let mut entry = sorted[i as usize].clone();
         entry.rank = i.checked_add(1).unwrap_or(u32::MAX);
         result.push_back(entry);
     }
     result
+}
+
+fn compare_leaderboard_entries(
+    left: &MarketLeaderboardEntry,
+    right: &MarketLeaderboardEntry,
+) -> core::cmp::Ordering {
+    right
+        .stake
+        .cmp(&left.stake)
+        .then_with(|| left.last_bet_timestamp.cmp(&right.last_bet_timestamp))
 }
 
 
