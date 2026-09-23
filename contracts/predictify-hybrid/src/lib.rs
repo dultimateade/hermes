@@ -5058,12 +5058,14 @@ impl PredictifyHybrid {
             .unwrap_or_else(|_| String::from_str(&env, "unknown"))
     }
 
-    /// Remove the oldest `count` completed recovery history entries for a market (admin only).
+    /// Reject attempts to remove completed recovery history entries.
     ///
-    /// Active (unresolved) recovery state is never pruned. `count` is capped at 30.
+    /// Recovery history is an append-only audit trail. This compatibility
+    /// entrypoint always returns `Error::InvalidState` for an authorized admin.
     ///
     /// # Errors
     /// * `Unauthorized` - Caller is not admin
+    /// * `InvalidState` - Recovery history is immutable
     pub fn prune_recovery_history(
         env: Env,
         admin: Address,
