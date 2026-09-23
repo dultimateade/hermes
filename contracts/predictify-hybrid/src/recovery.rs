@@ -938,7 +938,6 @@ mod tests {
     use alloc::string::ToString;
     use soroban_sdk::vec;
     use soroban_sdk::testutils::Address as _;
-    use soroban_sdk::vec;
     use soroban_sdk::testutils::Ledger;
 
     struct RecoveryTest {

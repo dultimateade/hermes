@@ -13,3 +13,16 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[[test]]
+name = "auth_boundary"
+path = "tests/auth_boundary.rs"
+
+[[test]]
+name = "pause_behavior"
+path = "tests/pause_behavior.rs"
+
+[[test]]
+name = "err_stability"
+path = "tests/err_stability.rs"
+

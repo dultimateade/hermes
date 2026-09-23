@@ -29,7 +29,6 @@ mod force_resolve;
 mod event_archive;
 pub mod events;
 mod extensions;
-mod events;
 pub mod gov_registry;
 mod fees;
 mod gas;
@@ -74,22 +73,18 @@ mod market_analytics;
 mod performance_benchmarks;
 mod disputes;
 mod edge_cases;
-mod extensions;
 mod graceful_degradation;
 mod market_id_generator;
 mod metadata_limits;
 mod queries;
 mod recovery;
 mod statistics;
-mod tokens;
 mod rate_limiter;
 mod dispute_multisig;
 mod event_topic_catalog;
 mod storage_tier_audit;
 mod leaderboard;
 mod lists;
-mod audit_trail;
-mod monitor;
 mod capabilities;
 
 #[cfg(test)]
@@ -5100,7 +5095,7 @@ impl PredictifyHybrid {
     ) -> crate::recovery::PendingMarketRecovery {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::initiate_recovery(
+        match crate::recovery::RecoveryTimelockConfig::initiate_recovery(
             &env,
             &admin,
             &market_id,
@@ -5135,7 +5130,7 @@ impl PredictifyHybrid {
     pub fn execute_market_recovery(env: Env, admin: Address, market_id: Symbol) -> bool {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::execute_recovery(&env, &admin, &market_id)
+        match crate::recovery::RecoveryTimelockConfig::execute_recovery(&env, &admin, &market_id)
         {
             Ok(success) => {
                 crate::audit_trail::AuditTrailManager::append_record(
@@ -5164,7 +5159,7 @@ impl PredictifyHybrid {
     pub fn cancel_market_recovery(env: Env, admin: Address, market_id: Symbol) {
         Self::require_primary_admin_or_panic(&env, &admin);
 
-        match crate::recovery::RecoveryTimelockManager::cancel_recovery(
+        match crate::recovery::RecoveryTimelockConfig::cancel_recovery(
             &env,
             &admin,
             &market_id,
@@ -5188,14 +5183,14 @@ impl PredictifyHybrid {
         env: Env,
         market_id: Symbol,
     ) -> Option<crate::recovery::PendingMarketRecovery> {
-        crate::recovery::RecoveryTimelockManager::get_pending(&env, &market_id)
+        crate::recovery::RecoveryTimelockConfig::get_pending(&env, &market_id)
     }
 
     /// Returns the current recovery timelock configuration.
     ///
     /// Read-only query; no authentication required.
     pub fn get_recovery_timelock_config(env: Env) -> crate::recovery::RecoveryTimelockConfig {
-        crate::recovery::RecoveryTimelockManager::get_config(&env)
+        crate::recovery::RecoveryTimelockConfig::get_config(&env)
     }
 
     // ===== VERSIONING FUNCTIONS =====
