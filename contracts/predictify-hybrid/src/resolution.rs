@@ -74,7 +74,7 @@ pub enum ResolutionState {
 /// // Calculate confidence score
 /// let confidence = MarketResolutionManager::calculate_oracle_confidence(&oracle_resolution);
 /// println!("Oracle confidence: {}%", confidence);
-/// # Ok::<(), predictify_hybrid::errors::Error>(())
+/// # Ok::<(), predictify_hybrid::Error>(())
 /// ```
 ///
 /// # Price Comparison Logic
@@ -98,7 +98,7 @@ pub enum ResolutionState {
 /// )?;
 ///
 /// assert_eq!(outcome, String::from_str(&env, "yes")); // BTC > $50k = "yes"
-/// # Ok::<(), predictify_hybrid::errors::Error>(())
+/// # Ok::<(), predictify_hybrid::Error>(())
 /// ```
 ///
 /// # Validation Requirements
