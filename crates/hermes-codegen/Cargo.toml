@@ -1,0 +1,8 @@
+[package]
+name = "hermes-codegen"
+version = "0.1.0"
+edition = "2021"
+description = "Build-time code generation for Hermes contracts from canonical error registry"
+
+[dependencies]
+hermes-errors = { path = "../hermes-errors" }

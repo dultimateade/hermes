@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+  "crates/hermes-errors",
+  "crates/hermes-codegen",
   "contracts/*",
   "contracts/predictify-hybrid/fuzz",
   "contracts/disputes/fuzz",
