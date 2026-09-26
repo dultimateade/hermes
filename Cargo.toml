@@ -1,3 +1,7 @@
+# Workspace configuration with consistent WASM optimization
+# All contracts use the release profile below for production builds
+# Additional configuration in .cargo/config.toml ensures cross-target consistency
+
 [workspace]
 resolver = "2"
 members = [
