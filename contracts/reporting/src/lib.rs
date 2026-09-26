@@ -39,7 +39,7 @@ mod pause;
 mod types;
 
 pub use err::ReportingError;
-pub use types::DataKey;
+pub use types::{DataKey, Report};
 
 use soroban_sdk::{contract, contractimpl, Address, Env, String};
 
@@ -104,6 +104,10 @@ impl ReportingContract {
     /// * `report_hash`  — On-chain commitment hash of the off-chain report
     ///                    document (e.g. SHA-256 hex string).
     ///
+    /// # Returns
+    ///
+    /// The numeric ID of the newly created report.
+    ///
     /// # Errors
     ///
     /// * [`ReportingError::ReportingPaused`] — Reporting is currently paused;
@@ -118,12 +122,57 @@ impl ReportingContract {
         market_id: u32,
         report_data: String,
         report_hash: String,
-    ) -> Result<(), ReportingError> {
+    ) -> Result<u32, ReportingError> {
         reporter.require_auth();
         // Guard: halt state changes when paused.
         pause::require_not_paused(&env)?;
-        let _ = (market_id, report_data, report_hash);
-        Ok(())
+
+        // Allocate a new report ID.
+        let report_id: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::NextReportId)
+            .unwrap_or(1);
+
+        let next_id = report_id
+            .checked_add(1)
+            .expect("report ID overflow");
+
+        // Create the report.
+        let report = Report {
+            id: report_id,
+            market_id,
+            reporter: reporter.clone(),
+            report_data,
+            report_hash,
+            status: 0, // Default status: pending
+            created_at: env.ledger().sequence(),
+        };
+
+        // Store the report by ID.
+        env.storage()
+            .persistent()
+            .set(&DataKey::Report(report_id), &report);
+
+        // Add report ID to the market's report list.
+        let mut market_reports: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::MarketReports(market_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        market_reports.push_back(report_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MarketReports(market_id), &market_reports);
+
+        // Increment the ID counter for the next report.
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextReportId, &next_id);
+
+        Ok(report_id)
     }
 
     /// Verify a previously submitted report.
@@ -352,6 +401,48 @@ impl ReportingContract {
     // -----------------------------------------------------------------------
     // Read-only views
     // -----------------------------------------------------------------------
+
+    /// Retrieve all report IDs associated with a specific market.
+    ///
+    /// # Parameters
+    ///
+    /// * `market_id` — Identifier of the market to query.
+    ///
+    /// # Returns
+    ///
+    /// A vector of report IDs submitted against the specified market.
+    /// Returns an empty vector if no reports exist for this market.
+    ///
+    /// This is a read-only view; it does **not** require authentication and
+    /// is resilient to event expiry.
+    pub fn get_reports_by_market(env: Env, market_id: u32) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::MarketReports(market_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Retrieve a specific report by ID.
+    ///
+    /// # Parameters
+    ///
+    /// * `report_id` — Identifier of the report to retrieve.
+    ///
+    /// # Returns
+    ///
+    /// The report if it exists, otherwise returns an error.
+    ///
+    /// # Errors
+    ///
+    /// * [`ReportingError::ReportNotFound`] — No report with the given ID exists.
+    ///
+    /// This is a read-only view; it does **not** require authentication.
+    pub fn get_report(env: Env, report_id: u32) -> Result<Report, ReportingError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Report>(&DataKey::Report(report_id))
+            .ok_or(ReportingError::ReportNotFound)
+    }
 
     /// Return whether reporting is currently paused.
     ///
