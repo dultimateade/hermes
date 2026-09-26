@@ -1015,7 +1015,7 @@ impl DisputeManager {
             0
         };
 
-        for i in start_idx..history.len().saturating_sub(1) {
+        for i in start_idx..history.len() {
             if let Some(prev_dispute) = history.get(i) {
                 if prev_dispute.user != user {
                     let stake_diff = if prev_dispute.stake > stake { prev_dispute.stake - stake } else { stake - prev_dispute.stake };
