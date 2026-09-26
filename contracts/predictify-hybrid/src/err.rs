@@ -328,6 +328,26 @@ pub enum Error {
     UserNotWhitelisted = 541,
     /// Market creator is blacklisted.
     CreatorBlacklisted = 542,
+
+    // ===== DELEGATION ERRORS (550-559) =====
+    /// Delegation not found for the specified delegator and delegate pair.
+    DelegationNotFound = 550,
+    /// Attempted to delegate to oneself. Self-delegation is not allowed.
+    DelegationSelfDelegation = 551,
+    /// Circular delegation detected. Delegation would create a circular chain (A->B->A).
+    DelegationCircular = 552,
+    /// Delegator already has a delegation to another address.
+    DelegationAlreadyExists = 553,
+    /// Delegate already has delegators assigned. Exceeds max delegations per account.
+    DelegationMaxExceeded = 554,
+    /// Delegation cooldown period is still active. Cannot revoke without waiting.
+    DelegationCooldownActive = 555,
+    /// Unauthorized delegation operation. Only delegator or delegate can modify the delegation.
+    DelegationUnauthorized = 556,
+    /// Delegation is expired and no longer valid.
+    DelegationExpired = 557,
+    /// Invalid delegation parameters provided.
+    DelegationInvalidParams = 558,
 }
 
 // ===== ERROR CATEGORIZATION AND RECOVERY SYSTEM =====

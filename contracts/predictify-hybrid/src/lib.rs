@@ -24,6 +24,7 @@ mod batch_operations;
 mod bets;
 pub mod circuit_breaker;
 mod config;
+mod delegation;
 mod err;
 mod force_resolve;
 mod event_archive;
@@ -69,6 +70,7 @@ mod utils;
 mod validation;
 mod versioning;
 mod voting;
+mod voting_delegation_integration;
 mod market_analytics;
 mod performance_benchmarks;
 mod disputes;
@@ -6031,7 +6033,312 @@ impl PredictifyHybrid {
         upgrade_manager::UpgradeManager::test_upgrade_safety(&env, &proposal)
     }
 
-    // ===== MARKET ANALYTICS FUNCTIONS =====
+    // ===== DELEGATION ENTRYPOINTS (Governance) =====
+
+    /// Establish a voting delegation from delegator to delegate.
+    ///
+    /// This entrypoint allows an account (delegator) to delegate voting rights
+    /// to another account (delegate), enabling institutional participants to
+    /// maintain voting authority in cold storage while delegating active voting
+    /// to a hot wallet.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegator` authorization. The delegator must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account delegating voting rights (must authorize)
+    /// * `delegate` - Account receiving voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation established successfully
+    /// - `Err(Error)` - Validation or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationSelfDelegation` - Cannot delegate to self
+    /// - `Error::DelegationCircular` - Would create circular delegation
+    /// - `Error::Unauthorized` - Delegator did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `set_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Security Properties
+    ///
+    /// - Delegator-controlled: Only the delegator can establish the delegation
+    /// - Single active delegate: Each delegator can have only one active delegate
+    /// - Non-circular: System prevents A->B->A delegation chains
+    /// - No self-delegation: Cannot delegate to oneself
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Cold storage delegates to hot wallet
+    /// PredictifyHybrid::delegate_votes(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn delegate_votes(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::delegate_votes(&env, delegator, delegate)
+    }
+
+    /// Revoke a voting delegation.
+    ///
+    /// This entrypoint removes a voting delegation, restoring full voting authority
+    /// to the delegator. Only the delegator can revoke their own delegation.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegator` authorization. The delegator must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that established the delegation
+    /// * `delegate` - Account currently holding voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation revoked successfully
+    /// - `Err(Error)` - Delegation not found or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationNotFound` - No delegation exists for this pair
+    /// - `Error::Unauthorized` - Delegator did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `unset_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Security Properties
+    ///
+    /// - Delegator-controlled: Only delegator can revoke
+    /// - Irreversible: Must re-establish delegation if needed
+    /// - Audited: Revocation recorded in history for compliance
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Delegator revokes their delegation
+    /// PredictifyHybrid::unset_delegate(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn unset_delegate(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::unset_delegate(&env, delegator, delegate)
+    }
+
+    /// Revoke a delegation from the delegate's perspective.
+    ///
+    /// This entrypoint allows a delegate to revoke their own voting authority,
+    /// useful for emergency disabling if keys are compromised. This is a
+    /// self-revocation operation.
+    ///
+    /// # Authentication
+    ///
+    /// Requires `delegate` authorization. The delegate must sign this transaction.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that established the delegation
+    /// * `delegate` - Account revoking their own authority (must authorize)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<(), Error>` where:
+    /// - `Ok(())` - Delegation revoked by delegate successfully
+    /// - `Err(Error)` - Delegation not found or authorization failed
+    ///
+    /// # Errors
+    ///
+    /// This function returns:
+    /// - `Error::DelegationNotFound` - No delegation exists for this pair
+    /// - `Error::Unauthorized` - Delegate did not authorize
+    ///
+    /// # Events
+    ///
+    /// Emits `unset_delegate` governance event with delegator and delegate addresses.
+    ///
+    /// # Use Cases
+    ///
+    /// - Delegate compromises its own keys and needs to self-disable
+    /// - Delegate wants to reduce authority scope
+    /// - Security incident response
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Hot wallet compromised - revoke its own authority
+    /// PredictifyHybrid::revoke_delegation(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    /// ```
+    pub fn revoke_delegation(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<(), Error> {
+        delegation::DelegationManager::revoke_delegation(&env, delegator, delegate)
+    }
+
+    /// Query whether a delegation exists between two addresses.
+    ///
+    /// This read-only entrypoint checks if a valid delegation exists from a
+    /// delegator to a delegate.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account with voting rights
+    /// * `delegate` - Account with voting authority
+    ///
+    /// # Returns
+    ///
+    /// Returns `bool`:
+    /// - `true` - Delegation exists and is active
+    /// - `false` - No delegation found
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let has_delegation = PredictifyHybrid::has_delegation(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// );
+    ///
+    /// if has_delegation {
+    ///     println!("Cold storage has delegated to hot wallet");
+    /// }
+    /// ```
+    pub fn has_delegation(env: Env, delegator: Address, delegate: Address) -> bool {
+        delegation::DelegationManager::has_delegation(&env, &delegator, &delegate)
+    }
+
+    /// Get the currently active delegate for an account.
+    ///
+    /// This read-only entrypoint retrieves the account currently authorized to
+    /// vote on behalf of a delegator. Each delegator can have at most one active
+    /// delegate.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account to query
+    ///
+    /// # Returns
+    ///
+    /// Returns `Option<Address>`:
+    /// - `Some(address)` - The current active delegate
+    /// - `None` - No active delegation
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// match PredictifyHybrid::get_active_delegate(env, cold_storage_address) {
+    ///     Some(delegate) => println!("Currently delegating to: {}", delegate),
+    ///     None => println!("No active delegation"),
+    /// }
+    /// ```
+    pub fn get_active_delegate(env: Env, delegator: Address) -> Option<Address> {
+        delegation::DelegationManager::get_active_delegate(&env, &delegator)
+    }
+
+    /// Get all delegations for a specific delegator.
+    ///
+    /// This read-only entrypoint retrieves all active delegations for an account.
+    /// Since each account can have at most one active delegate, this will return
+    /// at most one delegation.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account to query
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<Vec<Delegation>, Error>`:
+    /// - `Ok(vec)` - Vector of delegations (0 or 1 element)
+    /// - `Err(Error)` - Storage error
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let delegations = PredictifyHybrid::get_delegations_by_delegator(
+    ///     env,
+    ///     cold_storage_address,
+    /// )?;
+    ///
+    /// for delegation in delegations {
+    ///     println!("Delegated since: {}", delegation.activated_at);
+    /// }
+    /// ```
+    pub fn get_delegations_by_delegator(
+        env: Env,
+        delegator: Address,
+    ) -> Result<Vec<delegation::Delegation>, Error> {
+        delegation::DelegationManager::get_delegations_by_delegator(&env, &delegator)
+    }
+
+    /// Get the revocation history for a delegator-delegate pair.
+    ///
+    /// This read-only entrypoint retrieves the complete audit trail of revocations
+    /// for compliance and forensic purposes.
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `delegator` - Account that delegated
+    /// * `delegate` - Account that received delegation
+    ///
+    /// # Returns
+    ///
+    /// Returns `Result<Vec<Revocation>, Error>`:
+    /// - `Ok(vec)` - Vector of revocation records
+    /// - `Err(Error)` - Storage error
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let revocations = PredictifyHybrid::get_revocation_history(
+    ///     env,
+    ///     cold_storage_address,
+    ///     hot_wallet_address,
+    /// )?;
+    ///
+    /// println!("Revocations: {}", revocations.len());
+    /// ```
+    pub fn get_revocation_history(
+        env: Env,
+        delegator: Address,
+        delegate: Address,
+    ) -> Result<Vec<delegation::Revocation>, Error> {
+        delegation::DelegationManager::get_revocation_history(&env, &delegator, &delegate)
+    }
 
     /// Get comprehensive market statistics for data analysis and insights
     ///
