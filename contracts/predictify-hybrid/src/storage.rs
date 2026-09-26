@@ -80,14 +80,14 @@ pub(crate) fn bump_market_ttl(env: &Env, key: &impl IntoVal<Env, Val>) {
 /// 1. `effective_ttl = MIN(MARKET_TTL_LEDGERS, env.storage().max_ttl())`
 /// 2. The current ledger sequence plus `effective_ttl` must not overflow `u32`.
 /// # Errors
-/// Returns [`Error::InsufficientStorageRent`] if the sequence would overflow.
+/// Returns [`Error::InsufficientStorageRentBudget`] if the sequence would overflow.
 pub fn check_market_creation_rent(env: &Env) -> Result<(), Error> {
     let effective_ttl = MARKET_TTL_LEDGERS.min(env.storage().max_ttl());
     let current_seq = env.ledger().sequence();
 
-    if current_seq.checked_add(effective_ttl).is_none() {
-        return Err(Error::InsufficientStorageRentBudget);
-    }
+    current_seq
+        .checked_add(effective_ttl)
+        .ok_or(Error::InsufficientStorageRentBudget)?;
 
     Ok(())
 }
@@ -118,7 +118,7 @@ pub fn check_market_creation_rent(env: &Env) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns [`Error::InsufficientStorageRentBudget`] if the aggregate budget
-/// would overflow `u32`.
+/// would overflow `u32` or if approaching the u32::MAX boundary.
 pub fn check_market_creation_rent_budget(env: &Env) -> Result<(), Error> {
     let effective_ttl = MARKET_TTL_LEDGERS.min(env.storage().max_ttl());
 
@@ -126,8 +126,9 @@ pub fn check_market_creation_rent_budget(env: &Env) -> Result<(), Error> {
         .checked_mul(MARKET_CREATION_PERSISTENT_KEYS)
         .ok_or(Error::InsufficientStorageRentBudget)?;
 
-    env.ledger()
-        .sequence()
+    let current_seq = env.ledger().sequence();
+
+    current_seq
         .checked_add(required)
         .ok_or(Error::InsufficientStorageRentBudget)?;
 
