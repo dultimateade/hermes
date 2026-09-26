@@ -145,6 +145,16 @@ error_code_snapshot! {
     UserNotWhitelisted = 541,
     CreatorBlacklisted = 542,
 
+    DelegationNotFound = 550,
+    DelegationSelfDelegation = 551,
+    DelegationCircular = 552,
+    DelegationAlreadyExists = 553,
+    DelegationMaxExceeded = 554,
+    DelegationCooldownActive = 555,
+    DelegationUnauthorized = 556,
+    DelegationExpired = 557,
+    DelegationInvalidParams = 558,
+
     ReasonTableFull = 670,
     Overflow = 672,
     MaxBetCapExceeded = 673,
@@ -154,7 +164,7 @@ error_code_snapshot! {
 
 #[test]
 fn contract_error_codes_are_stable() {
-    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 120);
+    assert_eq!(ERROR_CODE_SNAPSHOT.len(), 129);
 
     for &(error, expected) in ERROR_CODE_SNAPSHOT {
         assert_eq!(
