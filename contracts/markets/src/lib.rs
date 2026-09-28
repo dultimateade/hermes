@@ -50,6 +50,10 @@ pub enum DataKey {
     Admin,
     /// Liquidity provided by a user to a specific market.
     Liquidity(u32, Address),
+    /// Records that a winner has already claimed their payout for a market.
+    /// Written **before** any token transfer in `claim_winnings` to uphold the
+    /// checks-effects-interactions pattern and prevent reentrancy double-claims.
+    ClaimedBet(u32, Address),
 }
 
 /// On-chain representation of a prediction market.
@@ -247,12 +251,24 @@ impl MarketsContract {
     ///
     /// Requires `claimant.require_auth()`.
     ///
+    /// # Checks-Effects-Interactions
+    ///
+    /// The `AlreadyClaimed` flag is written to persistent storage **before**
+    /// any token transfer would occur.  This upholds the
+    /// checks-effects-interactions (CEI) pattern and closes the reentrancy
+    /// window described in issue #21: a re-entrant call on the token contract
+    /// cannot trigger a second successful `claim_winnings` because the guard
+    /// is already set by the time the external call is made.
+    ///
     /// # Panics
     ///
-    /// Panics if the market does not exist, has not been resolved, or the
-    /// claimant did not place a winning bet.
+    /// Panics if the market does not exist, has not been resolved, the
+    /// claimant did not place a winning bet, or the claimant has already
+    /// claimed their winnings for this market.
     pub fn claim_winnings(env: Env, claimant: Address, market_id: u32) {
         claimant.require_auth();
+
+        // ── CHECKS ───────────────────────────────────────────────────────────
 
         let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
             Some(m) => m,
@@ -261,6 +277,18 @@ impl MarketsContract {
 
         if !market.resolved {
             panic_with_error!(env, ContractError::MarketNotResolved);
+        }
+
+        // Guard: reject a second claim for the same (market, claimant) pair.
+        // This check must come before the effect write below so that an
+        // already-set flag is caught even if this function is somehow entered
+        // twice within a single call-tree (re-entrancy via a token callback).
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::ClaimedBet(market_id, claimant.clone()))
+        {
+            panic_with_error!(env, ContractError::AlreadyClaimed);
         }
 
         // Verify that the claimant placed a bet on the winning outcome.
@@ -276,6 +304,21 @@ impl MarketsContract {
         if bet.outcome_index != market.winning_outcome {
             panic_with_error!(env, ContractError::InvalidOutcome);
         }
+
+        // ── EFFECTS ──────────────────────────────────────────────────────────
+
+        // Mark the bet as claimed BEFORE any external call (token transfer).
+        // Writing this flag here closes the reentrancy window: if the
+        // token contract re-enters claim_winnings, the guard above will fire.
+        env.storage()
+            .persistent()
+            .set(&DataKey::ClaimedBet(market_id, claimant.clone()), &true);
+
+        // ── INTERACTIONS ─────────────────────────────────────────────────────
+
+        // Token transfer would be performed here, after the state update.
+        // The `bet.amount` is available for the transfer logic.
+        let _ = bet.amount;
     }
 
     /// Cancels a market before it has been resolved.
