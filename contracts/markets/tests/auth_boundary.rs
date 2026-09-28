@@ -356,7 +356,57 @@ fn test_claim_winnings_requires_auth_success() {
     assert!(result.is_ok(), "Winner should claim winnings");
 }
 
-// ── cancel_market ────────────────────────────────────────────────────────────
+// ── Reentrancy / double-claim guard (issue #21) ───────────────────────────────
+
+/// Regression test for issue #21.
+///
+/// Verifies that a second `claim_winnings` call for the same (market, user)
+/// pair is rejected with `AlreadyClaimed`, even when the market is resolved
+/// and the original bet was on the winning outcome.  The `AlreadyClaimed` flag
+/// is written to persistent storage **before** any token transfer, so this
+/// check covers the reentrancy window described in the issue.
+#[test]
+fn test_claim_winnings_rejects_double_claim() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    let market_id = create_market_with_auth_check(&setup);
+
+    // user1 places a winning bet on outcome 0.
+    setup.client.place_bet(&setup.user1, &market_id, &0, &100);
+
+    env.ledger().set(LedgerInfo {
+        timestamp: 1735689600 + 90000,
+        protocol_version: 25,
+        sequence_number: 2,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 518400,
+    });
+
+    setup
+        .client
+        .resolve_market(&setup.market_creator, &market_id, &0);
+
+    // First claim: must succeed.
+    let first = setup.client.try_claim_winnings(&setup.user1, &market_id);
+    assert!(first.is_ok(), "First claim should succeed");
+
+    // Second claim: must be rejected as AlreadyClaimed.
+    let second = setup.client.try_claim_winnings(&setup.user1, &market_id);
+    assert!(
+        second.is_err(),
+        "Second claim must be rejected (double-claim / reentrancy guard)"
+    );
+    assert_eq!(
+        second.unwrap_err().unwrap(),
+        markets::ContractError::AlreadyClaimed,
+        "Error must be AlreadyClaimed (code 15)"
+    );
+}
 
 #[test]
 fn test_cancel_market_requires_auth() {
