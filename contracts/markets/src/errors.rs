@@ -34,6 +34,10 @@ pub enum ContractError {
     AdminAddressInvalid = 13,
     /// The requested admin operation is not permitted in the current contract state.
     AdminOperationNotPermitted = 14,
+    /// Winnings already claimed; thrown when a winner attempts to claim a second time
+    /// for the same market.  Guards the checks-effects-interactions invariant in
+    /// `claim_winnings`.
+    AlreadyClaimed = 15,
 }
 
 #[cfg(test)]
@@ -56,5 +60,6 @@ mod tests {
         assert_eq!(ContractError::AdminCooldownActive as u32, 12);
         assert_eq!(ContractError::AdminAddressInvalid as u32, 13);
         assert_eq!(ContractError::AdminOperationNotPermitted as u32, 14);
+        assert_eq!(ContractError::AlreadyClaimed as u32, 15);
     }
 }
