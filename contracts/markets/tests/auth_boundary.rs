@@ -13,7 +13,7 @@ use soroban_sdk::{
 fn setup_test_environment(env: &Env) -> TestSetup<'_> {
     env.ledger().set(LedgerInfo {
         timestamp: 1735689600,
-        protocol_version: 25,
+        protocol_version: 22,
         sequence_number: 1,
         network_id: [0; 32],
         base_reserve: 10,
@@ -72,12 +72,12 @@ fn create_market_with_mock_auth(setup: &TestSetup<'_>) -> u32 {
             contract: &setup.contract_id,
             fn_name: "create_market",
             args: (
-                &setup.market_creator,
-                &question,
-                &description,
-                &end_time,
-                &resolution_source,
-                &outcome_tags,
+                setup.market_creator.clone(),
+                question.clone(),
+                description.clone(),
+                end_time,
+                resolution_source.clone(),
+                outcome_tags.clone(),
             )
                 .into_val(env),
             sub_invokes: &[],
@@ -291,16 +291,7 @@ fn test_claim_winnings_requires_auth() {
     setup.client.place_bet(&setup.user1, &market_id, &0, &100);
 
     // Advance ledger past end time.
-    env.ledger().set(LedgerInfo {
-        timestamp: 1735689600 + 90000,
-        protocol_version: 25,
-        sequence_number: 2,
-        network_id: [0; 32],
-        base_reserve: 10,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 1,
-        max_entry_ttl: 518400,
-    });
+    env.ledger().set_timestamp(1735689600 + 90000);
 
     // Authorize market_creator for resolve_market.
     let win_outcome = 0u32;
@@ -337,16 +328,7 @@ fn test_claim_winnings_requires_auth_success() {
 
     setup.client.place_bet(&setup.user1, &market_id, &0, &100);
 
-    env.ledger().set(LedgerInfo {
-        timestamp: 1735689600 + 90000,
-        protocol_version: 25,
-        sequence_number: 2,
-        network_id: [0; 32],
-        base_reserve: 10,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 1,
-        max_entry_ttl: 518400,
-    });
+    env.ledger().set_timestamp(1735689600 + 90000);
 
     setup
         .client
@@ -376,16 +358,7 @@ fn test_claim_winnings_rejects_double_claim() {
     // user1 places a winning bet on outcome 0.
     setup.client.place_bet(&setup.user1, &market_id, &0, &100);
 
-    env.ledger().set(LedgerInfo {
-        timestamp: 1735689600 + 90000,
-        protocol_version: 25,
-        sequence_number: 2,
-        network_id: [0; 32],
-        base_reserve: 10,
-        min_temp_entry_ttl: 1,
-        min_persistent_entry_ttl: 1,
-        max_entry_ttl: 518400,
-    });
+    env.ledger().set_timestamp(1735689600 + 90000);
 
     setup
         .client
@@ -403,7 +376,7 @@ fn test_claim_winnings_rejects_double_claim() {
     );
     assert_eq!(
         second.unwrap_err().unwrap(),
-        markets::ContractError::AlreadyClaimed,
+        markets::ContractError::AlreadyClaimed.into(),
         "Error must be AlreadyClaimed (code 15)"
     );
 }

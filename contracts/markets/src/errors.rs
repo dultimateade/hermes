@@ -38,6 +38,16 @@ pub enum ContractError {
     /// for the same market.  Guards the checks-effects-interactions invariant in
     /// `claim_winnings`.
     AlreadyClaimed = 15,
+    /// Proposal not found; thrown when interacting with a non-existent pause proposal.
+    ProposalNotFound = 16,
+    /// Duplicate approval; thrown when an admin attempts to approve the same proposal twice.
+    ProposalAlreadyApproved = 17,
+    /// Proposal not executable; timelock has not expired or approval threshold not met.
+    ProposalNotExecutable = 18,
+    /// Invalid payout curve configuration.
+    InvalidPayoutCurve = 19,
+    /// Insufficient balance for withdrawal or operation.
+    InsufficientBalance = 20,
 }
 
 #[cfg(test)]
@@ -61,5 +71,10 @@ mod tests {
         assert_eq!(ContractError::AdminAddressInvalid as u32, 13);
         assert_eq!(ContractError::AdminOperationNotPermitted as u32, 14);
         assert_eq!(ContractError::AlreadyClaimed as u32, 15);
+        assert_eq!(ContractError::ProposalNotFound as u32, 16);
+        assert_eq!(ContractError::ProposalAlreadyApproved as u32, 17);
+        assert_eq!(ContractError::ProposalNotExecutable as u32, 18);
+        assert_eq!(ContractError::InvalidPayoutCurve as u32, 19);
+        assert_eq!(ContractError::InsufficientBalance as u32, 20);
     }
 }
