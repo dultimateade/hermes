@@ -27,6 +27,8 @@ pub enum ContractError {
     NoPendingFeeCommit = 10,
     /// Fee config apply was attempted before the timelock expired.
     FeeRevealTooEarly = 11,
+    /// Fee config apply was attempted before the timelock delay elapsed.
+    FeeApplyTooEarly = 12,
 }
 
 #[cfg(test)]
@@ -47,5 +49,6 @@ mod tests {
         assert_eq!(ContractError::BelowCollectionThreshold as u32, 9);
         assert_eq!(ContractError::NoPendingFeeCommit as u32, 10);
         assert_eq!(ContractError::FeeRevealTooEarly as u32, 11);
+        assert_eq!(ContractError::FeeApplyTooEarly as u32, 12);
     }
 }
