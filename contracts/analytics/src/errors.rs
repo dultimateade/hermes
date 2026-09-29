@@ -65,6 +65,12 @@ pub enum ContractError {
     AnalyticsPaused = 31,
     /// The requested operation is not permitted in the current contract state.
     InvalidState = 32,
+    /// The configured collection threshold is below the enforced minimum.
+    ///
+    /// A threshold of `0` (or any value below the minimum) would let
+    /// `collect_fees` drain any non-zero balance on every call, so such
+    /// values are rejected at configuration time.
+    ThresholdBelowMinimum = 33,
 }
 
 #[cfg(test)]
@@ -92,5 +98,6 @@ mod tests {
         assert_eq!(ContractError::InvalidConfig as u32, 30);
         assert_eq!(ContractError::AnalyticsPaused as u32, 31);
         assert_eq!(ContractError::InvalidState as u32, 32);
+        assert_eq!(ContractError::ThresholdBelowMinimum as u32, 33);
     }
 }
