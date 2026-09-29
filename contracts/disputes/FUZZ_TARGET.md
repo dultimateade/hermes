@@ -64,6 +64,13 @@ each step selects the action (see [Fuzz actions](#fuzz-actions)) and the
 remaining bytes are that action's payload. Longer files therefore drive longer
 action sequences in a single iteration.
 
+Seed files that exercise the commit-reveal path must carry a preimage of at
+least `MIN_PREIMAGE_LEN` bytes (see [Commit-reveal preimage
+length](#commit-reveal-preimage-length)). The historical 11-byte prefix is no
+longer accepted by the harness: it is below the enforced minimum and would be
+rejected before reaching the reveal logic, so it no longer reflects a valid
+preimage.
+
 Then either point `cargo fuzz` at that directory with libFuzzer's
 `-seed_inputs` flag:
 
@@ -80,6 +87,24 @@ cargo +nightly fuzz run \
 or copy the seed files directly into `contracts/disputes/fuzz/corpus/main/`
 before the first run. Both approaches leave the fuzzer free to keep growing the
 working corpus afterwards.
+
+---
+
+## Commit-reveal preimage length
+
+The commit-reveal scheme binds a commitment to a preimage that is only revealed
+during the apply window. A short preimage (the harness previously used an
+11-byte prefix) makes the commitment vulnerable to an offline preimage search
+before the apply window opens: an attacker can enumerate the small preimage
+space and recover the secret ahead of time.
+
+To make that search infeasible, the commit-reveal logic enforces a minimum
+preimage length of `MIN_PREIMAGE_LEN` bytes on both the commit and reveal paths.
+Commitments or reveals whose preimage is shorter than this minimum are rejected
+with `DisputeError` rather than being accepted. The fuzz harness mirrors this
+contract-level rule: its corpus prefix is sized to `MIN_PREIMAGE_LEN` so that
+seeded inputs represent a valid, sufficiently long preimage instead of the old
+11-byte short prefix.
 
 ---
 
@@ -116,6 +141,7 @@ Each byte slice drives a loop of up to six distinct actions:
 - Per-user stake cap enforcement → `DisputeStakeCapExceeded`
 - Vote by the dispute opener → `DisputerCannotVote`
 - Double-voting by the same voter → `DisputeAlreadyVoted`
+- Commit-reveal preimage shorter than `MIN_PREIMAGE_LEN` → `DisputeError`
 - Resolution before / after votes are cast
 - Arbitrary byte sequences must not panic
 
