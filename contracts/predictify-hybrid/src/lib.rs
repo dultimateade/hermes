@@ -14,6 +14,7 @@ pub const SYM_ADMIN: &str = "Admin";
 pub const ORACLE_FAILURE_PRIMARY_THEN_FALLBACK_REASON: &str = "Primary oracle failed, fallback also failed";
 const SYM_ALLOWED_ASSETS: &str = "allowed"; 
 
+#[path = "admin/mod.rs"]
 mod admin;
 pub mod analytics;
 pub mod audit;
@@ -59,6 +60,10 @@ mod oracle_validation_tests;
 #[cfg(test)]
 #[path = "tests/market_closed_tests.rs"]
 mod market_closed_tests;
+
+#[cfg(test)]
+#[path = "tests/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod cross_oracle_staleness_tests;

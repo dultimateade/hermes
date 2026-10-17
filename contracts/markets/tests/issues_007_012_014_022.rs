@@ -34,7 +34,7 @@ fn setup_test_env() -> TestEnv<'static> {
     let client = MarketsContractClient::new(&env, &contract_id);
 
     // Initialize admin
-    client.transfer_ownership(&admin1, &admin1);
+    client.initialize(&admin1);
 
     let token_contract = env.register_stellar_asset_contract_v2(admin1.clone());
     let token_address = token_contract.address();
@@ -327,6 +327,44 @@ fn test_default_winner_takes_all_payout() {
         lose_res.unwrap_err().unwrap(),
         ContractError::InvalidOutcome.into()
     );
+}
+
+#[test]
+fn test_liquidity_providers_receive_pro_rata_winning_payout_share() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.add_liquidity(&te.admin1, &market_id, &100);
+    te.client.add_liquidity(&te.admin2, &market_id, &300);
+    te.client.place_bet(&te.bettor1, &market_id, &0, &100);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &900);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    // Reserve 10% of the winner's gross payout and split it 1:3 by liquidity.
+    assert_eq!(te.client.calculate_payout(&market_id, &te.bettor1), 900);
+    assert_eq!(te.client.claim_winnings(&te.bettor1, &market_id), 900);
+    assert_eq!(te.client.collect_fees(&te.admin1, &market_id), 25);
+    assert_eq!(te.client.collect_fees(&te.admin2, &market_id), 75);
+    assert_eq!(te.client.collect_fees(&te.admin1, &market_id), 0);
+}
+
+#[test]
+fn test_removing_liquidity_preserves_accrued_rewards() {
+    let te = setup_test_env();
+    let market_id = create_standard_market(&te, 2);
+
+    te.client.add_liquidity(&te.admin1, &market_id, &100);
+    te.client.add_liquidity(&te.admin2, &market_id, &100);
+    te.client.place_bet(&te.bettor1, &market_id, &0, &100);
+    te.client.place_bet(&te.bettor2, &market_id, &1, &900);
+    te.client.resolve_market(&te.creator, &market_id, &0);
+
+    te.client.claim_winnings(&te.bettor1, &market_id);
+    te.client.remove_liquidity(&te.admin1, &market_id, &100);
+
+    // Removing principal does not forfeit rewards earned before removal.
+    assert_eq!(te.client.collect_fees(&te.admin1, &market_id), 50);
+    assert_eq!(te.client.collect_fees(&te.admin2, &market_id), 50);
 }
 
 #[test]

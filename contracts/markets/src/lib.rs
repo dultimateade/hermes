@@ -6,24 +6,6 @@
 //! Provides a prediction-market subsystem where every state-changing
 //! entrypoint enforces `require_auth` on the acting [`Address`].
 //!
-//! # User Balance Fee Model
-//!
-//! Deposits are fee-free: `deposit_user_balance` credits the full deposited
-//! amount to the user's internal balance. Fees are charged on exit instead.
-//! `withdraw_user_balance` charges the greater of the configured minimum fee
-//! and the basis-point fee on the requested withdrawal amount, except when
-//! dust or full-withdrawal rules waive the fee. It removes the requested amount
-//! from the internal balance and returns the post-fee `net_amount`; it does not
-//! transfer tokens. `collect_user_fees` is a separate admin-triggered charge
-//! based on the user's full current balance; it deducts from that balance and
-//! adds to the collected-fees counter, without transferring tokens out of the
-//! contract.
-//!
-//! These two fee paths are not mutually exclusive. An admin collection does
-//! not mark funds as already charged, so a later user withdrawal can charge
-//! another fee on the remaining balance. Callers should not use both paths for
-//! the same funds when only one fee is intended.
-//!
 //! # Auth Matrix
 //!
 //! | Function                    | Required Role              |
@@ -54,19 +36,21 @@
 //! | `deposit_user_balance`      | User (any address)         |
 //! | `withdraw_user_balance`     | User (any address)         |
 //! | `collect_user_fees`         | Admin                      |
+//! | `collect_fees`              | Liquidity provider         |
 //! | `set_fee_config`            | Admin                      |
 //! | `version`                   | Anyone (read-only)         |
 
 pub mod errors;
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, panic_with_error, Address, Env, Map, String, Vec,
+};
 
 pub use errors::ContractError;
 
 /// Type alias used by generated client code and test harnesses.
 pub type Error = ContractError;
 
-/// Finite safety bound for deployments that have not configured a market limit.
 const DEFAULT_MAX_MARKET_COUNT: u32 = 10_000;
 
 /// Persistent-storage keys used by the Markets contract.
@@ -75,7 +59,7 @@ const DEFAULT_MAX_MARKET_COUNT: u32 = 10_000;
 pub enum DataKey {
     /// Sequential counter for generating unique market IDs.
     MarketCounter,
-    /// Maximum number of markets that may be created.
+    /// Maximum number of markets allowed.
     MarketLimit,
     /// Market data keyed by the numeric market ID.
     Market(u32),
@@ -87,15 +71,24 @@ pub enum DataKey {
     Admin,
     /// Whether the contract has been initialized.
     Initialized,
+    /// List of additional authorized admin addresses.
+    AdminList,
     /// Liquidity provided by a user to a specific market.
     Liquidity(u32, Address),
+    /// Total liquidity provided to a market.
+    TotalLiquidity(u32),
+    /// Cumulative LP reward per unit of liquidity, scaled by `LP_REWARD_SCALE`.
+    LiquidityRewardIndex(u32),
+    /// Reward index checkpoint for a liquidity provider.
+    LiquidityRewardDebt(u32, Address),
+    /// Uncollected LP rewards for a provider.
+    LiquidityRewards(u32, Address),
     /// Records that a winner has already claimed their payout for a market.
     /// Written **before** any token transfer in `claim_winnings` to uphold the
     /// checks-effects-interactions pattern and prevent reentrancy double-claims.
     ClaimedBet(u32, Address),
-    /// Fractional payout numerator carried forward per market outcome.
+    /// Fractional payout numerator carried forward per outcome.
     PayoutRemainder(u32, u32),
-
     /// Winning outcome indices recorded when a market is resolved.
     WinningOutcomes(u32),
 
@@ -277,6 +270,10 @@ pub mod admin;
 #[contract]
 pub struct MarketsContract;
 
+/// Share of winning payouts reserved for liquidity providers (10%).
+pub const LP_PAYOUT_SHARE_BPS: i128 = 1_000;
+const LP_REWARD_SCALE: i128 = 1_000_000_000_000;
+
 impl MarketsContract {
     // -----------------------------------------------------------------------
     //  Internal Helpers
@@ -288,12 +285,9 @@ impl MarketsContract {
             .persistent()
             .get::<_, Address>(&DataKey::Admin)
         {
-            if &admin == caller {
+            if admin == *caller {
                 return true;
             }
-        } else {
-            // First caller with admin action becomes initial admin if unset.
-            return true;
         }
 
         let admin_list: Vec<Address> = env
@@ -353,6 +347,359 @@ impl MarketsContract {
                 outcomes
             })
     }
+
+    fn lp_payout_fee(env: &Env, market_id: u32, gross_payout: i128) -> i128 {
+        let total_liquidity: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLiquidity(market_id))
+            .unwrap_or(0);
+        if total_liquidity <= 0 || gross_payout <= 0 {
+            return 0;
+        }
+
+        gross_payout
+            .checked_mul(LP_PAYOUT_SHARE_BPS)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow))
+            / 10_000
+    }
+
+    fn settle_liquidity_rewards(
+        env: &Env,
+        market_id: u32,
+        provider: &Address,
+        liquidity_amount: i128,
+    ) -> i128 {
+        let reward_index: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityRewardIndex(market_id))
+            .unwrap_or(0);
+        let reward_debt: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityRewardDebt(market_id, provider.clone()))
+            .unwrap_or(0);
+        let accrued = liquidity_amount
+            .checked_mul(reward_index)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow))
+            / LP_REWARD_SCALE;
+        let newly_earned = accrued
+            .checked_sub(reward_debt)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
+        if newly_earned < 0 {
+            panic_with_error!(env, ContractError::InvalidState);
+        }
+
+        let pending: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityRewards(market_id, provider.clone()))
+            .unwrap_or(0);
+        let updated_pending = pending
+            .checked_add(newly_earned)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
+        env.storage().persistent().set(
+            &DataKey::LiquidityRewards(market_id, provider.clone()),
+            &updated_pending,
+        );
+        updated_pending
+    }
+
+    fn update_liquidity_reward_debt(
+        env: &Env,
+        market_id: u32,
+        provider: &Address,
+        liquidity_amount: i128,
+    ) {
+        let reward_index: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityRewardIndex(market_id))
+            .unwrap_or(0);
+        let reward_debt = liquidity_amount
+            .checked_mul(reward_index)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow))
+            / LP_REWARD_SCALE;
+        env.storage().persistent().set(
+            &DataKey::LiquidityRewardDebt(market_id, provider.clone()),
+            &reward_debt,
+        );
+    }
+
+    fn accrue_liquidity_reward(env: &Env, market_id: u32, fee_amount: i128) {
+        if fee_amount <= 0 {
+            return;
+        }
+        let total_liquidity: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLiquidity(market_id))
+            .unwrap_or(0);
+        if total_liquidity <= 0 {
+            return;
+        }
+
+        let scaled_reward = fee_amount
+            .checked_mul(LP_REWARD_SCALE)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
+        let index_increment = scaled_reward / total_liquidity;
+        let reward_index: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LiquidityRewardIndex(market_id))
+            .unwrap_or(0);
+        let updated_index = reward_index
+            .checked_add(index_increment)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
+        env.storage()
+            .persistent()
+            .set(&DataKey::LiquidityRewardIndex(market_id), &updated_index);
+    }
+
+    fn scaled_weight_boundary(env: &Env, total_pool: i128, cumulative_weight: u32) -> i128 {
+        let whole = total_pool / 10_000;
+        let fraction = total_pool % 10_000;
+        let whole_share = match whole.checked_mul(cumulative_weight as i128) {
+            Some(value) => value,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        whole_share + (fraction * cumulative_weight as i128) / 10_000
+    }
+
+    fn custom_outcome_share(
+        env: &Env,
+        total_pool: i128,
+        curve: &PayoutCurveConfig,
+        outcome_index: u32,
+    ) -> i128 {
+        let mut cumulative_weight = 0u32;
+        let mut index = 0u32;
+        for weight in curve.custom_weights.iter() {
+            if index == outcome_index {
+                let next_weight = match cumulative_weight.checked_add(weight) {
+                    Some(value) => value,
+                    None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+                };
+                return Self::scaled_weight_boundary(env, total_pool, next_weight)
+                    - Self::scaled_weight_boundary(env, total_pool, cumulative_weight);
+            }
+            cumulative_weight = match cumulative_weight.checked_add(weight) {
+                Some(value) => value,
+                None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
+            };
+            index += 1;
+        }
+        0
+    }
+
+    fn proportional_payout(
+        env: &Env,
+        market_id: u32,
+        outcome_index: u32,
+        stake: i128,
+        outcome_share: i128,
+        outcome_pool: i128,
+    ) -> (i128, Option<(u32, i128)>) {
+        if outcome_pool <= 0 {
+            return (0, None);
+        }
+
+        let key = DataKey::PayoutRemainder(market_id, outcome_index);
+        let remainder: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        let numerator = match stake
+            .checked_mul(outcome_share)
+            .and_then(|value| value.checked_add(remainder))
+        {
+            Some(value) => value,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        (
+            numerator / outcome_pool,
+            Some((outcome_index, numerator % outcome_pool)),
+        )
+    }
+
+    fn calculate_payout_with_remainder(
+        env: Env,
+        market_id: u32,
+        claimant: Address,
+    ) -> (i128, Option<(u32, i128)>) {
+        let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
+            Some(m) => m,
+            None => return (0, None),
+        };
+        if !market.resolved {
+            return (0, None);
+        }
+
+        let bet: BetData = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Bet(market_id, claimant))
+        {
+            Some(b) => b,
+            None => return (0, None),
+        };
+
+        let curve: PayoutCurveConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketPayoutCurve(market_id))
+            .unwrap_or_else(|| PayoutCurveConfig::winner_takes_all(&env));
+        let total_pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MarketTotalPool(market_id))
+            .unwrap_or(bet.amount);
+        let win_pool: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OutcomePool(market_id, market.winning_outcome))
+            .unwrap_or(0);
+        let winning_outcomes = Self::winning_outcomes(&env, market_id, &market);
+
+        if winning_outcomes.len() > 1 {
+            if !winning_outcomes.contains(bet.outcome_index) {
+                return (0, None);
+            }
+            let outcome_pool: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
+                .unwrap_or(0);
+            if outcome_pool == 0 {
+                return (bet.amount, None);
+            }
+
+            let winner_count = winning_outcomes.len() as i128;
+            let mut rank = 0i128;
+            for outcome in winning_outcomes.iter() {
+                if outcome == bet.outcome_index {
+                    break;
+                }
+                rank += 1;
+            }
+            let base_share = total_pool / winner_count;
+            let extra_units = total_pool % winner_count;
+            let outcome_share = base_share + if rank < extra_units { 1 } else { 0 };
+            return Self::proportional_payout(
+                &env,
+                market_id,
+                bet.outcome_index,
+                bet.amount,
+                outcome_share,
+                outcome_pool,
+            );
+        }
+
+        match curve.curve_type {
+            PayoutCurveConfig::WINNER_TAKES_ALL => {
+                if bet.outcome_index != market.winning_outcome {
+                    return (0, None);
+                }
+                if win_pool == 0 {
+                    return (bet.amount, None);
+                }
+                Self::proportional_payout(
+                    &env,
+                    market_id,
+                    bet.outcome_index,
+                    bet.amount,
+                    total_pool,
+                    win_pool,
+                )
+            }
+            PayoutCurveConfig::TIERED => {
+                let ru_pool: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::OutcomePool(market_id, curve.runner_up_outcome))
+                    .unwrap_or(0);
+
+                if ru_pool == 0 {
+                    if bet.outcome_index == market.winning_outcome {
+                        if win_pool == 0 {
+                            return (bet.amount, None);
+                        }
+                        return Self::proportional_payout(
+                            &env,
+                            market_id,
+                            bet.outcome_index,
+                            bet.amount,
+                            total_pool,
+                            win_pool,
+                        );
+                    }
+                    return (0, None);
+                }
+
+                if win_pool == 0 {
+                    if bet.outcome_index == curve.runner_up_outcome {
+                        return Self::proportional_payout(
+                            &env,
+                            market_id,
+                            bet.outcome_index,
+                            bet.amount,
+                            total_pool,
+                            ru_pool,
+                        );
+                    }
+                    return (0, None);
+                }
+
+                let ru_share =
+                    Self::scaled_weight_boundary(&env, total_pool, curve.runner_up_bps);
+                let win_share = total_pool - ru_share;
+                if bet.outcome_index == market.winning_outcome {
+                    Self::proportional_payout(
+                        &env,
+                        market_id,
+                        bet.outcome_index,
+                        bet.amount,
+                        win_share,
+                        win_pool,
+                    )
+                } else if bet.outcome_index == curve.runner_up_outcome {
+                    Self::proportional_payout(
+                        &env,
+                        market_id,
+                        bet.outcome_index,
+                        bet.amount,
+                        ru_share,
+                        ru_pool,
+                    )
+                } else {
+                    (0, None)
+                }
+            }
+            PayoutCurveConfig::CUSTOM_WEIGHTS => {
+                let weight = curve.custom_weights.get(bet.outcome_index).unwrap_or(0);
+                if weight == 0 {
+                    return (0, None);
+                }
+                let outcome_pool: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
+                    .unwrap_or(0);
+                if outcome_pool == 0 {
+                    return (0, None);
+                }
+                let outcome_share =
+                    Self::custom_outcome_share(&env, total_pool, &curve, bet.outcome_index);
+                Self::proportional_payout(
+                    &env,
+                    market_id,
+                    bet.outcome_index,
+                    bet.amount,
+                    outcome_share,
+                    outcome_pool,
+                )
+            }
+            _ => (0, None),
+        }
+    }
 }
 
 #[contractimpl]
@@ -364,6 +711,24 @@ impl MarketsContract {
     /// @notice Returns the contract version.
     pub fn version(_env: Env) -> u32 {
         7
+    }
+
+    /// Initializes the contract with its first administrator exactly once.
+    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
+        admin.require_auth();
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::Initialized)
+            .unwrap_or(false)
+        {
+            return Err(ContractError::AdminOperationNotPermitted);
+        }
+
+        env.storage().persistent().set(&DataKey::Initialized, &true);
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage().persistent().set(&DataKey::Paused, &false);
+        Ok(())
     }
 
     /// @notice Read a market from persistent storage and bump its TTL.
@@ -476,6 +841,12 @@ impl MarketsContract {
     ) -> u32 {
         creator.require_auth();
 
+        if outcome_tags.len() < 2 {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        Self::validate_payout_curve(&env, &curve, outcome_tags.len());
+
         let counter: u32 = env
             .storage()
             .persistent()
@@ -484,12 +855,6 @@ impl MarketsContract {
         if counter >= Self::get_market_limit(env.clone()) {
             panic_with_error!(env, ContractError::MarketLimitReached);
         }
-
-        if outcome_tags.len() < 2 {
-            panic_with_error!(env, ContractError::InvalidConfig);
-        }
-
-        Self::validate_payout_curve(&env, &curve, outcome_tags.len());
 
         let market_id = match counter.checked_add(1) {
             Some(id) => id,
@@ -754,257 +1119,11 @@ impl MarketsContract {
             .extend_ttl(&DataKey::WinningOutcomes(market_id), ttl, ttl);
     }
 
-    /// Previews the payout amount for a claimant on a market (#014).
-    ///
-    /// Outcome-split remainders are assigned in outcome order. Claim-time
-    /// proportional remainders carry forward per outcome, preserving the
-    /// allocated pool across claims; previews reflect prior claims.
+    /// Previews the claimant's payout after the liquidity-provider share is reserved.
     pub fn calculate_payout(env: Env, market_id: u32, claimant: Address) -> i128 {
-        Self::calculate_payout_with_remainder(env, market_id, claimant).0
-    }
-
-    fn scaled_weight_boundary(env: &Env, total_pool: i128, cumulative_weight: u32) -> i128 {
-        let whole = total_pool / 10_000;
-        let fraction = total_pool % 10_000;
-        let whole_share = match whole.checked_mul(cumulative_weight as i128) {
-            Some(value) => value,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-        whole_share + (fraction * cumulative_weight as i128) / 10_000
-    }
-
-    fn custom_outcome_share(
-        env: &Env,
-        total_pool: i128,
-        curve: &PayoutCurveConfig,
-        outcome_index: u32,
-    ) -> i128 {
-        let mut cumulative_weight = 0u32;
-        let mut index = 0u32;
-        for weight in curve.custom_weights.iter() {
-            if index == outcome_index {
-                let next_weight = match cumulative_weight.checked_add(weight) {
-                    Some(value) => value,
-                    None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
-                };
-                return Self::scaled_weight_boundary(env, total_pool, next_weight)
-                    - Self::scaled_weight_boundary(env, total_pool, cumulative_weight);
-            }
-            cumulative_weight = match cumulative_weight.checked_add(weight) {
-                Some(value) => value,
-                None => panic_with_error!(env, ContractError::InvalidPayoutCurve),
-            };
-            index += 1;
-        }
-        0
-    }
-
-    fn proportional_payout(
-        env: &Env,
-        market_id: u32,
-        outcome_index: u32,
-        stake: i128,
-        outcome_share: i128,
-        outcome_pool: i128,
-    ) -> (i128, Option<(u32, i128)>) {
-        if outcome_pool <= 0 {
-            return (0, None);
-        }
-
-        let key = DataKey::PayoutRemainder(market_id, outcome_index);
-        let remainder: i128 = env.storage().persistent().get(&key).unwrap_or(0);
-        let numerator = match stake
-            .checked_mul(outcome_share)
-            .and_then(|value| value.checked_add(remainder))
-        {
-            Some(value) => value,
-            None => panic_with_error!(env, ContractError::Overflow),
-        };
-        (
-            numerator / outcome_pool,
-            Some((outcome_index, numerator % outcome_pool)),
-        )
-    }
-
-    fn calculate_payout_with_remainder(
-        env: Env,
-        market_id: u32,
-        claimant: Address,
-    ) -> (i128, Option<(u32, i128)>) {
-        let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
-            Some(m) => m,
-            None => return (0, None),
-        };
-        if !market.resolved {
-            return (0, None);
-        }
-
-        let bet: BetData = match env
-            .storage()
-            .persistent()
-            .get(&DataKey::Bet(market_id, claimant))
-        {
-            Some(b) => b,
-            None => return (0, None),
-        };
-
-        let curve: PayoutCurveConfig = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MarketPayoutCurve(market_id))
-            .unwrap_or_else(|| PayoutCurveConfig::winner_takes_all(&env));
-        let total_pool: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MarketTotalPool(market_id))
-            .unwrap_or(bet.amount);
-        let win_pool: i128 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::OutcomePool(market_id, market.winning_outcome))
-            .unwrap_or(0);
-        let winning_outcomes = Self::winning_outcomes(&env, market_id, &market);
-
-        if winning_outcomes.len() > 1 {
-            if !winning_outcomes.contains(bet.outcome_index) {
-                return (0, None);
-            }
-            let outcome_pool: i128 = env
-                .storage()
-                .persistent()
-                .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
-                .unwrap_or(0);
-            if outcome_pool == 0 {
-                return (bet.amount, None);
-            }
-
-            let winner_count = winning_outcomes.len() as i128;
-            let mut rank = 0i128;
-            for outcome in winning_outcomes.iter() {
-                if outcome == bet.outcome_index {
-                    break;
-                }
-                rank += 1;
-            }
-            let base_share = total_pool / winner_count;
-            let extra_units = total_pool % winner_count;
-            let outcome_share = base_share + if rank < extra_units { 1 } else { 0 };
-            return Self::proportional_payout(
-                &env,
-                market_id,
-                bet.outcome_index,
-                bet.amount,
-                outcome_share,
-                outcome_pool,
-            );
-        }
-
-        match curve.curve_type {
-            PayoutCurveConfig::WINNER_TAKES_ALL => {
-                if bet.outcome_index != market.winning_outcome {
-                    return (0, None);
-                }
-                if win_pool == 0 {
-                    return (bet.amount, None);
-                }
-                Self::proportional_payout(
-                    &env,
-                    market_id,
-                    bet.outcome_index,
-                    bet.amount,
-                    total_pool,
-                    win_pool,
-                )
-            }
-            PayoutCurveConfig::TIERED => {
-                let ru_pool: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::OutcomePool(market_id, curve.runner_up_outcome))
-                    .unwrap_or(0);
-
-                if ru_pool == 0 {
-                    if bet.outcome_index == market.winning_outcome {
-                        if win_pool == 0 {
-                            return (bet.amount, None);
-                        }
-                        return Self::proportional_payout(
-                            &env,
-                            market_id,
-                            bet.outcome_index,
-                            bet.amount,
-                            total_pool,
-                            win_pool,
-                        );
-                    }
-                    return (0, None);
-                }
-
-                if win_pool == 0 {
-                    if bet.outcome_index == curve.runner_up_outcome {
-                        return Self::proportional_payout(
-                            &env,
-                            market_id,
-                            bet.outcome_index,
-                            bet.amount,
-                            total_pool,
-                            ru_pool,
-                        );
-                    }
-                    return (0, None);
-                }
-
-                let ru_share =
-                    Self::scaled_weight_boundary(&env, total_pool, curve.runner_up_bps);
-                let win_share = total_pool - ru_share;
-                if bet.outcome_index == market.winning_outcome {
-                    Self::proportional_payout(
-                        &env,
-                        market_id,
-                        bet.outcome_index,
-                        bet.amount,
-                        win_share,
-                        win_pool,
-                    )
-                } else if bet.outcome_index == curve.runner_up_outcome {
-                    Self::proportional_payout(
-                        &env,
-                        market_id,
-                        bet.outcome_index,
-                        bet.amount,
-                        ru_share,
-                        ru_pool,
-                    )
-                } else {
-                    (0, None)
-                }
-            }
-            PayoutCurveConfig::CUSTOM_WEIGHTS => {
-                let weight = curve.custom_weights.get(bet.outcome_index).unwrap_or(0);
-                if weight == 0 {
-                    return (0, None);
-                }
-                let outcome_pool: i128 = env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::OutcomePool(market_id, bet.outcome_index))
-                    .unwrap_or(0);
-                if outcome_pool == 0 {
-                    return (0, None);
-                }
-                let outcome_share =
-                    Self::custom_outcome_share(&env, total_pool, &curve, bet.outcome_index);
-                Self::proportional_payout(
-                    &env,
-                    market_id,
-                    bet.outcome_index,
-                    bet.amount,
-                    outcome_share,
-                    outcome_pool,
-                )
-            }
-            _ => (0, None),
-        }
+        let (gross_payout, _) =
+            Self::calculate_payout_with_remainder(env.clone(), market_id, claimant);
+        gross_payout - Self::lp_payout_fee(&env, market_id, gross_payout)
     }
 
     /// Claims winnings for a resolved market upholding CEI pattern and applying
@@ -1040,11 +1159,13 @@ impl MarketsContract {
             None => panic_with_error!(env, ContractError::InvalidState),
         };
 
-        let (payout, remainder) =
+        let (gross_payout, remainder) =
             Self::calculate_payout_with_remainder(env.clone(), market_id, claimant.clone());
-        if payout < 0 || (payout == 0 && remainder.is_none()) {
+        if gross_payout < 0 || (gross_payout == 0 && remainder.is_none()) {
             panic_with_error!(env, ContractError::InvalidOutcome);
         }
+        let lp_fee = Self::lp_payout_fee(&env, market_id, gross_payout);
+        let payout = gross_payout - lp_fee;
 
         // ── EFFECTS ──────────────────────────────────────────────────────────
         if let Some((outcome_index, value)) = remainder {
@@ -1057,6 +1178,7 @@ impl MarketsContract {
         env.storage()
             .persistent()
             .set(&DataKey::ClaimedBet(market_id, claimant.clone()), &true);
+        Self::accrue_liquidity_reward(&env, market_id, lp_fee);
 
         // ── INTERACTIONS ─────────────────────────────────────────────────────
         let _ = bet.amount;
@@ -1115,127 +1237,269 @@ impl MarketsContract {
     }
 
     // -----------------------------------------------------------------------
-    //  Initialization
+    //  Liquidity
     // -----------------------------------------------------------------------
 
-    /// @notice Initializes the contract by setting the initial admin.
-    /// @dev    Stores `DataKey::Admin` and `DataKey::Initialized` atomically.
-    ///         Must be called exactly once after deployment before any admin
-    ///         entrypoint can be used.
-    /// @param env   The contract environment.
-    /// @param admin The initial admin/owner address.
-    /// @return `Ok(())` on success, or a [`ContractError`] variant.
-    pub fn initialize(env: Env, admin: Address) -> Result<(), ContractError> {
-        // Require the caller to authenticate before any state mutation.
-        admin.require_auth();
+    /// Adds liquidity to a market.
+    pub fn add_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
+        provider.require_auth();
 
-        // Prevent re-initialization.
-        if Self::is_initialized(&env) {
-            return Err(ContractError::AdminOperationNotPermitted);
+        if amount <= 0 {
+            panic_with_error!(env, ContractError::StakeTooSmall);
         }
 
-        env.storage().instance().set(&DataKey::Initialized, &true);
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        // Markets start unpaused.
-        env.storage().instance().set(&DataKey::Paused, &false);
+        let market: MarketData = match env.storage().persistent().get(&DataKey::Market(market_id)) {
+            Some(m) => m,
+            None => panic_with_error!(env, ContractError::MarketNotFound),
+        };
 
-        Ok(())
+        if market.resolved || market.cancelled {
+            panic_with_error!(env, ContractError::InvalidState);
+        }
+
+        let existing: LiquidityData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Liquidity(market_id, provider.clone()))
+            .unwrap_or(LiquidityData { total_amount: 0 });
+
+        Self::settle_liquidity_rewards(&env, market_id, &provider, existing.total_amount);
+
+        let new_total = match existing.total_amount.checked_add(amount) {
+            Some(t) => t,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        let market_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLiquidity(market_id))
+            .unwrap_or(0);
+        let new_market_total = market_total
+            .checked_add(amount)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::Overflow));
+
+        env.storage().persistent().set(
+            &DataKey::Liquidity(market_id, provider),
+            &LiquidityData {
+                total_amount: new_total,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLiquidity(market_id), &new_market_total);
+        Self::update_liquidity_reward_debt(&env, market_id, &provider, new_total);
+    }
+
+    /// Removes liquidity from a market.
+    pub fn remove_liquidity(env: Env, provider: Address, market_id: u32, amount: i128) {
+        provider.require_auth();
+
+        if amount <= 0 {
+            panic_with_error!(env, ContractError::StakeTooSmall);
+        }
+
+        if !env.storage().persistent().has(&DataKey::Market(market_id)) {
+            panic_with_error!(env, ContractError::MarketNotFound);
+        }
+
+        let existing: LiquidityData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Liquidity(market_id, provider.clone()))
+            .unwrap_or(LiquidityData { total_amount: 0 });
+
+        if amount > existing.total_amount {
+            panic_with_error!(env, ContractError::StakeTooSmall);
+        }
+
+        Self::settle_liquidity_rewards(&env, market_id, &provider, existing.total_amount);
+
+        let new_total = match existing.total_amount.checked_sub(amount) {
+            Some(t) => t,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        let market_total: i128 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TotalLiquidity(market_id))
+            .unwrap_or(0);
+        let new_market_total = market_total
+            .checked_sub(amount)
+            .filter(|total| *total >= 0)
+            .unwrap_or_else(|| panic_with_error!(env, ContractError::InvalidState));
+
+        env.storage().persistent().set(
+            &DataKey::Liquidity(market_id, provider),
+            &LiquidityData {
+                total_amount: new_total,
+            },
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::TotalLiquidity(market_id), &new_market_total);
+        Self::update_liquidity_reward_debt(&env, market_id, &provider, new_total);
+    }
+
+    /// Collect a provider's accrued share of winning-payout fees for a market.
+    ///
+    /// Winning payouts reserve `LP_PAYOUT_SHARE_BPS` basis points for liquidity
+    /// providers. The reserve is distributed pro rata by liquidity supplied when
+    /// each winning claim is made; this call returns the provider's accrued amount.
+    pub fn collect_fees(env: Env, provider: Address, market_id: u32) -> i128 {
+        provider.require_auth();
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Market(market_id))
+        {
+            panic_with_error!(env, ContractError::MarketNotFound);
+        }
+
+        let liquidity: LiquidityData = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Liquidity(market_id, provider.clone()))
+            .unwrap_or(LiquidityData { total_amount: 0 });
+        let reward = Self::settle_liquidity_rewards(
+            &env,
+            market_id,
+            &provider,
+            liquidity.total_amount,
+        );
+        env.storage().persistent().set(
+            &DataKey::LiquidityRewards(market_id, provider.clone()),
+            &0i128,
+        );
+        Self::update_liquidity_reward_debt(&env, market_id, &provider, liquidity.total_amount);
+        reward
     }
 
     // -----------------------------------------------------------------------
-    //  Admin-gated entrypoints
+    //  Issue #022: User Bet Enumeration
     // -----------------------------------------------------------------------
 
-    /// @notice Pauses all markets globally.
-    /// @dev    Requires the caller to be the registered admin.
-    /// @param env    The contract environment.
-    /// @param caller The admin address (must pass auth and admin check).
-    /// @return `Ok(())` on success, or a [`ContractError`] variant.
-    pub fn pause_markets(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::assert_is_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Paused, &true);
-        Ok(())
+    /// Returns the total number of markets on which the user has placed bets.
+    pub fn get_user_bet_count(env: Env, user: Address) -> u32 {
+        let user_markets: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserBetMarkets(user))
+            .unwrap_or(Vec::new(&env));
+        user_markets.len()
     }
 
-    /// @notice Unpauses all markets globally.
-    /// @dev    Requires the caller to be the registered admin.
-    /// @param env    The contract environment.
-    /// @param caller The admin address (must pass auth and admin check).
-    /// @return `Ok(())` on success, or a [`ContractError`] variant.
-    pub fn unpause_markets(env: Env, caller: Address) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::assert_is_admin(&env, &caller)?;
-        env.storage().instance().set(&DataKey::Paused, &false);
-        Ok(())
-    }
-
-    /// @notice Transfers contract ownership to a new admin address.
-    /// @dev    Requires the caller to be the registered admin. The new admin
-    ///         must differ from the current admin.
-    /// @param env         The contract environment.
-    /// @param current_admin The current admin (must pass auth and admin check).
-    /// @param new_admin    The new admin address to set.
-    /// @return `Ok(())` on success, or a [`ContractError`] variant.
-    pub fn transfer_ownership(
+    /// Enumerates bets placed by a user with start_index and limit pagination (#022).
+    ///
+    /// Preserves insertion order across markets.
+    pub fn get_user_bets(
         env: Env,
-        current_admin: Address,
-        new_admin: Address,
-    ) -> Result<(), ContractError> {
-        current_admin.require_auth();
-        Self::assert_is_admin(&env, &current_admin)?;
-
-        if new_admin == current_admin {
-            return Err(ContractError::AdminAddressInvalid);
+        user: Address,
+        start_index: u32,
+        limit: u32,
+    ) -> Vec<UserBetInfo> {
+        let mut results = Vec::new(&env);
+        if limit == 0 {
+            return results;
         }
 
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        Ok(())
-    }
+        let user_markets: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::UserBetMarkets(user.clone()))
+            .unwrap_or(Vec::new(&env));
 
-    /// @notice Adds a second admin address (co-admin).
-    /// @dev    Requires the caller to be the registered admin. Currently only
-    ///         stores a single admin; this entrypoint replaces the admin with
-    ///         the new address and is kept for forward compatibility with a
-    ///         multi-admin model.
-    /// @param env        The contract environment.
-    /// @param caller     The current admin (must pass auth and admin check).
-    /// @param new_admin  The admin address to add.
-    /// @return `Ok(())` on success, or a [`ContractError`] variant.
-    pub fn add_admin(
-        env: Env,
-        caller: Address,
-        new_admin: Address,
-    ) -> Result<(), ContractError> {
-        caller.require_auth();
-        Self::assert_is_admin(&env, &caller)?;
-
-        if new_admin == caller {
-            return Err(ContractError::AdminAddressInvalid);
+        let total = user_markets.len();
+        if start_index >= total {
+            return results;
         }
 
-        // Store the new admin alongside the existing admin.
-        // For now we support a single admin; this entrypoint replaces it.
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        Ok(())
+        let end = core::cmp::min(start_index.saturating_add(limit), total);
+        for i in start_index..end {
+            let market_id = user_markets.get(i).unwrap();
+            if let Some(bet) = env
+                .storage()
+                .persistent()
+                .get::<_, BetData>(&DataKey::Bet(market_id, user.clone()))
+            {
+                let claimed: bool = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::ClaimedBet(market_id, user.clone()))
+                    .unwrap_or(false);
+
+                // bet.amount is validated > 0 in place_bet, so the cast to u128 is safe.
+                results.push_back(UserBetInfo {
+                    market_id,
+                    outcome_index: bet.outcome_index,
+                    amount: bet.amount as u128,
+                    claimed,
+                });
+            }
+        }
+
+        results
     }
 
     // -----------------------------------------------------------------------
-    //  Read-only admin queries
+    //  Issue #012: Dust-Safe Balance & Withdrawal System
     // -----------------------------------------------------------------------
 
-    /// @notice Returns the current admin address.
-    /// @dev    Read-only — does not require auth. Returns `None` if not set.
-    /// @param env The contract environment.
-    /// @return `Some(Address)` if an admin is set, `None` otherwise.
-    pub fn get_admin(env: Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Admin)
+    /// Configures the withdrawal fee parameters (#012).
+    pub fn set_fee_config(env: Env, admin: Address, min_fee_amount: i128, fee_bps: i128) {
+        Self::require_admin(&env, &admin);
+
+        if min_fee_amount < 0 || !(0..=10_000).contains(&fee_bps) {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MinFeeAmount, &min_fee_amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::WithdrawalFeeBps, &fee_bps);
+    }
+
+    /// Returns the configured (min_fee_amount, fee_bps) (#012).
+    pub fn get_fee_config(env: Env) -> (i128, i128) {
+        let min_fee = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinFeeAmount)
+            .unwrap_or(100i128);
+        let fee_bps = env
+            .storage()
+            .persistent()
+            .get(&DataKey::WithdrawalFeeBps)
+            .unwrap_or(100i128); // 1.00%
+        (min_fee, fee_bps)
+    }
+
+    /// Reads the internal balance of a user (#012).
+    pub fn get_user_balance(env: Env, user: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::UserBalance(user))
+            .unwrap_or(0i128)
+    }
+
+    /// Configures the token contract used for user balance deposits.
+    pub fn set_token_address(env: Env, admin: Address, token_address: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::TokenAddress, &token_address);
+    }
+
+    /// Returns the total platform fees collected (#012).
+    pub fn get_collected_fees(env: Env) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CollectedFees)
+            .unwrap_or(0i128)
     }
 
     /// Deposits funds into a user's internal withdrawable balance (#012).
-    ///
-    /// No fee is charged on deposit; the full `amount` is transferred in and
-    /// credited to the user's internal balance.
     pub fn deposit_user_balance(env: Env, user: Address, amount: i128) {
         user.require_auth();
 
@@ -1258,20 +1522,11 @@ impl MarketsContract {
         token_client.transfer(&user, &env.current_contract_address(), &amount);
 
         env.storage()
-            .instance()
-            .get(&DataKey::Paused)
-            .unwrap_or(false)
+            .persistent()
+            .set(&DataKey::UserBalance(user), &new_balance);
     }
 
     /// Withdraws funds from a user's balance with dust protection (#012).
-    ///
-    /// The fee is calculated from the requested `amount` as the greater of
-    /// the configured minimum and the basis-point fee. The full requested
-    /// amount is removed from the internal balance, and the post-fee amount is
-    /// returned as `net_amount`; this method does not transfer tokens. The fee
-    /// is added to the collected-fees counter. This is independent of
-    /// `collect_user_fees`, so both paths can charge fees against the same
-    /// funds at different times.
     ///
     /// # Dust Invariant
     /// If the user's available balance is `<= min_fee_amount`, it is classified
@@ -1340,15 +1595,53 @@ impl MarketsContract {
 
     /// Admin fee collection from user account with dust-safe protection (#012).
     ///
-    /// This charges against the user's full current internal balance and adds
-    /// the amount to the collected-fees counter; it does not transfer tokens
-    /// out of the contract. It is independent of `withdraw_user_balance`, so
-    /// a later withdrawal can charge another fee on the remaining balance.
-    ///
     /// If a user balance is `<= min_fee_amount`, fees are not collected and 0 is returned,
     /// ensuring dust is never locked and `InsufficientBalance` is never thrown.
     pub fn collect_user_fees(env: Env, admin: Address, user: Address) -> i128 {
         Self::require_admin(&env, &admin);
+
+        let balance = Self::get_user_balance(env.clone(), user.clone());
+        let (min_fee, fee_bps) = Self::get_fee_config(env.clone());
+
+        if balance <= min_fee {
+            // Dust-safe: do not fail with InsufficientBalance and do not trap user dust!
+            return 0;
+        }
+
+        let calculated_fee = (balance * fee_bps) / 10_000;
+        let fee = core::cmp::max(calculated_fee, min_fee);
+
+        if balance < fee {
+            return 0;
+        }
+
+        let new_balance = balance - fee;
+        env.storage()
+            .persistent()
+            .set(&DataKey::UserBalance(user), &new_balance);
+
+        let collected = Self::get_collected_fees(env.clone());
+        let new_collected = match collected.checked_add(fee) {
+            Some(c) => c,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::CollectedFees, &new_collected);
+
+        fee
+    }
+
+    // -----------------------------------------------------------------------
+    //  Issue #007: Hardened Admin Pause Mechanism
+    // -----------------------------------------------------------------------
+
+    /// Set the maximum number of markets that may be created.
+    pub fn set_market_limit(env: Env, admin: Address, max_market_count: u32) {
+        Self::require_admin(&env, &admin);
+        if max_market_count == 0 {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::MarketLimit, &max_market_count);
@@ -1386,8 +1679,15 @@ impl MarketsContract {
     }
 
     /// Adds an administrator to the authorized admin list (#007).
-    pub fn add_admin(env: Env, admin: Address, new_admin: Address) {
+    pub fn add_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), ContractError> {
         Self::require_admin(&env, &admin);
+        if admin == new_admin {
+            return Err(ContractError::AdminAddressInvalid);
+        }
 
         let mut list: Vec<Address> = env
             .storage()
@@ -1399,6 +1699,7 @@ impl MarketsContract {
             list.push_back(new_admin);
             env.storage().persistent().set(&DataKey::AdminList, &list);
         }
+        Ok(())
     }
 
     /// Proposes a global market pause with a stated justification (#007).
@@ -1441,40 +1742,138 @@ impl MarketsContract {
         };
 
         env.storage()
-            .instance()
-            .get(&DataKey::Initialized)
-            .unwrap_or(false)
+            .persistent()
+            .set(&DataKey::PauseProposal(proposal_id), &proposal);
+
+        proposal_id
     }
 
-    /// @notice Returns the stored admin address, or `None` if unset.
-    fn get_admin_internal(env: &Env) -> Option<Address> {
-        env.storage().instance().get(&DataKey::Admin)
-    }
+    /// Approves a pending pause proposal (#007).
+    pub fn approve_pause(env: Env, admin: Address, proposal_id: u32) {
+        Self::require_admin(&env, &admin);
 
-    /// @notice Checks whether `caller` is the registered admin.
-    /// @dev    Returns `false` when no admin is stored (does **not** return
-    ///         `true` for an unset admin — this closes the bootstrap hole).
-    /// @param env    The contract environment.
-    /// @param caller The address to check.
-    /// @return `true` if the caller matches the stored admin, `false` otherwise.
-    fn is_admin_internal(env: &Env, caller: &Address) -> bool {
-        match Self::get_admin_internal(env) {
-            Some(admin) => admin == *caller,
-            None => false,
+        let mut proposal: PauseProposal = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseProposal(proposal_id))
+        {
+            Some(p) => p,
+            None => panic_with_error!(env, ContractError::ProposalNotFound),
+        };
+
+        if proposal.executed || proposal.cancelled {
+            panic_with_error!(env, ContractError::ProposalNotExecutable);
         }
+
+        if proposal.approvals.contains(&admin) {
+            panic_with_error!(env, ContractError::ProposalAlreadyApproved);
+        }
+
+        proposal.approvals.push_back(admin);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseProposal(proposal_id), &proposal);
     }
 
-    /// @notice Asserts that `caller` is the registered admin.
-    /// @dev    Returns `Err(ContractError::Unauthorized)` when the admin is
-    ///         unset or the caller does not match.
-    /// @param env    The contract environment.
-    /// @param caller The address to verify.
-    /// @return `Ok(())` if the caller is the admin, or a [`ContractError`].
-    fn assert_is_admin(env: &Env, caller: &Address) -> Result<(), ContractError> {
-        if !Self::is_admin_internal(env, caller) {
-            return Err(ContractError::Unauthorized);
+    /// Executes an approved and timelocked pause proposal (#007).
+    pub fn execute_pause(env: Env, caller: Address, proposal_id: u32) {
+        Self::require_admin(&env, &caller);
+
+        let mut proposal: PauseProposal = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseProposal(proposal_id))
+        {
+            Some(p) => p,
+            None => panic_with_error!(env, ContractError::ProposalNotFound),
+        };
+
+        if proposal.executed || proposal.cancelled {
+            panic_with_error!(env, ContractError::ProposalNotExecutable);
         }
+
+        let (_, required_approvals) = Self::get_pause_config(env.clone());
+        if proposal.approvals.len() < required_approvals {
+            panic_with_error!(env, ContractError::ProposalNotExecutable);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.eta {
+            panic_with_error!(env, ContractError::ProposalNotExecutable);
+        }
+
+        proposal.executed = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseProposal(proposal_id), &proposal);
+
+        env.storage().persistent().set(&DataKey::Paused, &true);
+    }
+
+    /// Cancels a pending pause proposal (#007).
+    pub fn cancel_pause(env: Env, admin: Address, proposal_id: u32) {
+        Self::require_admin(&env, &admin);
+
+        let mut proposal: PauseProposal = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::PauseProposal(proposal_id))
+        {
+            Some(p) => p,
+            None => panic_with_error!(env, ContractError::ProposalNotFound),
+        };
+
+        if proposal.executed || proposal.cancelled {
+            panic_with_error!(env, ContractError::ProposalNotExecutable);
+        }
+
+        proposal.cancelled = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::PauseProposal(proposal_id), &proposal);
+    }
+
+    /// Reads a pause proposal by ID. Only administrators may view proposal details (#007).
+    pub fn get_pause_proposal(env: Env, admin: Address, proposal_id: u32) -> Option<PauseProposal> {
+        Self::require_admin(&env, &admin);
+        env.storage()
+            .persistent()
+            .get(&DataKey::PauseProposal(proposal_id))
+    }
+
+    /// Pauses all market operations globally.
+    ///
+    /// # Hardened Protection
+    /// If hardened pause protection is active (required_approvals > 1 or delay > 0),
+    /// unilateral instantaneous execution is blocked with `AdminOperationNotPermitted` (#007).
+    pub fn pause_markets(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+
+        let (delay, required_approvals) = Self::get_pause_config(env.clone());
+        if delay > 0 || required_approvals > 1 {
+            panic_with_error!(env, ContractError::AdminOperationNotPermitted);
+        }
+
+        env.storage().persistent().set(&DataKey::Paused, &true);
+    }
+
+    /// Resumes all market operations globally.
+    pub fn unpause_markets(env: Env, admin: Address) {
+        Self::require_admin(&env, &admin);
+        env.storage().persistent().set(&DataKey::Paused, &false);
+    }
+
+    /// Transfers contract ownership to a new admin address.
+    pub fn transfer_ownership(
+        env: Env,
+        admin: Address,
+        new_owner: Address,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &admin);
+        if admin == new_owner {
+            return Err(ContractError::AdminAddressInvalid);
+        }
+        env.storage().persistent().set(&DataKey::Admin, &new_owner);
         Ok(())
     }
-
 }

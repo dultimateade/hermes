@@ -31,6 +31,19 @@ fn setup_test_environment(env: &Env) -> TestSetup<'_> {
     let contract_id = env.register(MarketsContract, ());
     let client = MarketsContractClient::new(env, &contract_id);
 
+    let init_args = (admin.clone(),).into_val(env);
+    env.mock_auths(&[MockAuth {
+        address: &admin,
+        invoke: &MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: init_args,
+            sub_invokes: &[],
+        },
+    }]);
+    client.initialize(&admin);
+    let _ = env.auths();
+
     TestSetup {
         admin,
         market_creator,
@@ -169,7 +182,6 @@ fn test_market_limit_blocks_both_creation_entrypoints() {
     let setup = setup_test_environment(&env);
     env.mock_all_auths();
 
-    setup.client.transfer_ownership(&setup.admin, &setup.admin);
     assert_eq!(setup.client.get_market_limit(), 10_000);
 
     let unauthorized_result = setup
@@ -222,6 +234,28 @@ fn test_market_limit_blocks_both_creation_entrypoints() {
         ContractError::MarketLimitReached.into()
     );
     assert_eq!(setup.client.get_market_for_resolution(&2), None);
+}
+
+#[test]
+fn test_uninitialized_contract_rejects_admin_actions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let attacker = Address::generate(&env);
+    let contract_id = env.register(MarketsContract, ());
+    let client = MarketsContractClient::new(&env, &contract_id);
+
+    assert_eq!(client.get_admin(), None);
+    assert_eq!(
+        client.try_pause_markets(&attacker).unwrap_err().unwrap(),
+        ContractError::Unauthorized.into()
+    );
+    assert_eq!(
+        client
+            .try_transfer_ownership(&attacker, &Address::generate(&env))
+            .unwrap_err()
+            .unwrap(),
+        ContractError::Unauthorized.into()
+    );
 }
 
 #[test]

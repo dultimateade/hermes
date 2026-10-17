@@ -16,6 +16,7 @@
 
 use soroban_sdk::{testutils::Address as _, Address, Env, Symbol, Vec};
 use allowlist::{AllowlistContract, AllowlistContractClient, AllowlistError};
+use proptest::prelude::*;
 
 struct Ctx {
     env: Env,
@@ -306,5 +307,57 @@ fn batch_is_allow_duplicates() {
     // Both entries for the same address should be true
     for (_, is_allowed) in &results {
         assert!(*is_allowed, "duplicate address should still be allowed");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn batch_is_allowed_properties(
+        allowlist_len in 1usize..=5,
+        arbitrary_indices in prop::collection::vec(0usize..10, 0..=10),
+        absent_len in 1usize..=5,
+    ) {
+        let ctx = Ctx::new(10);
+        let list_id = ctx.sym("batch_props");
+        ctx.client.create_allowlist(&ctx.admin, &list_id);
+
+        let mut members = Vec::new(&ctx.env);
+        for index in 0..allowlist_len {
+            members.push_back(ctx.user(index as u32));
+        }
+        ctx.client.add_addresses(&ctx.admin, &list_id, &members);
+
+        for scenario in 0u8..5 {
+            let query_indices: std::vec::Vec<usize> = match scenario {
+                0 => std::vec::Vec::new(),
+                // One more address than the allowlist contains.
+                1 => (0..=allowlist_len).collect(),
+                // The query consists entirely of allowlisted addresses.
+                2 => (0..allowlist_len).collect(),
+                // These indices are outside the allowlist's 0..5 member range.
+                3 => (5..5 + absent_len).collect(),
+                // Arbitrary inputs also exercise duplicates and mixed membership.
+                _ => arbitrary_indices.clone(),
+            };
+
+            let mut query = Vec::new(&ctx.env);
+            for index in &query_indices {
+                query.push_back(ctx.user(*index as u32));
+            }
+
+            let results = ctx.client.batch_is_allowed(&list_id, &query);
+            prop_assert_eq!(results.len() as usize, query_indices.len());
+
+            for (position, index) in query_indices.iter().enumerate() {
+                let (address, allowed) = results.get(position as u32).unwrap();
+                prop_assert_eq!(address, ctx.user(*index as u32));
+                prop_assert_eq!(allowed, *index < allowlist_len);
+            }
+        }
     }
 }
