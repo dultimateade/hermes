@@ -1,4 +1,5 @@
 commit_out.txt
+.git_commit_msg.txt
 
 # Rust build artifacts
 target/

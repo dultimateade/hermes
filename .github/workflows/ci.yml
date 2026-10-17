@@ -18,6 +18,25 @@ jobs:
         with:
           fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Verify active Rust toolchain
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          expected = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          active = subprocess.check_output(
+              ["rustup", "show", "active-toolchain"], text=True
+          ).split()[0]
+          host = subprocess.check_output(["rustup", "show", "host"], text=True).strip()
+
+          if active not in (expected, f"{expected}-{host}"):
+              raise SystemExit(
+                  f"Rust toolchain mismatch: expected {expected!r}, got {active!r}"
+              )
+          print(f"Verified active Rust toolchain: {active} (configured: {expected})")
+          PY
       - name: Run workspace tests
         run: cargo test --workspace
       - name: Verify committed snapshot goldens

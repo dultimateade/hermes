@@ -36,6 +36,16 @@
 
 /// Named bit-flag constants for oracle contract capabilities.
 ///
+/// This unit struct is a namespace, not a typed flag set. The contract returns
+/// a `u64` bitmap as its stable ABI, which lets older clients inspect known
+/// bits while preserving unknown bits introduced by future versions. Changing
+/// the return type would change that ABI; wrapping the constants locally would
+/// still require conversion at the contract boundary.
+///
+/// Callers may combine these constants into masks, but such masks are only
+/// client-side checks: the contract emits [`SUPPORTED_CAPABILITIES`] and does
+/// not accept arbitrary capability combinations as input.
+///
 /// Each constant is a power-of-two `u64` that can be combined with `|` to
 /// form a bitmap, and isolated with `&` to test a specific capability.
 ///
