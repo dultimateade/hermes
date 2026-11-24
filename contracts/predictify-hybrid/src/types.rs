@@ -1053,6 +1053,12 @@ pub struct Market {
     /// Resolution timeout in seconds after `end_time`.
     ///
     /// Automatic oracle resolution stops once `ledger.timestamp() >= end_time + resolution_timeout`.
+    ///
+    /// **Timestamp semantics:** this duration is in **ledger-time seconds**.  At the
+    /// default of 86 400 s (24 hours) the effective real-world deadline matches
+    /// wall-clock time to within minutes.  Values below 300 s are inadvisable
+    /// because ledger-time drift would represent a material fraction of the window.
+    /// See docs/TIMESTAMP_ASSUMPTIONS.md §10.
     pub resolution_timeout: u64,
     /// Oracle result (set after market ends)
     pub oracle_result: Option<String>,
@@ -1095,7 +1101,13 @@ pub struct Market {
     pub min_pool_size: Option<i128>,
     /// Bet deadline (Unix timestamp). No bets accepted after this time. 0 = use end_time (no early cutoff).
     pub bet_deadline: u64,
-    /// Dispute window in seconds after end_time. Payouts allowed only after end_time + this period (or dispute resolved).
+    /// Dispute window in seconds after end_time.
+    ///
+    /// Payouts are allowed only after `end_time + dispute_window_seconds` has passed
+    /// (or the dispute is resolved).  Measured in **ledger-time seconds**.
+    /// At the default of 86 400 s (24 hours) ledger-time drift is negligible.
+    /// Values below 3 600 s (1 hour) are inadvisable; for windows below 2 hours
+    /// consider ledger-sequence-based expiry.  See docs/TIMESTAMP_ASSUMPTIONS.md §11.
     pub dispute_window_seconds: u64,
     /// Whether unclaimed winnings have already been swept for this market.
     /// Set to true after the first successful sweep to prevent double-crediting the treasury.
@@ -4033,6 +4045,11 @@ pub struct Event {
     /// Resolution timeout in seconds after `end_time`.
     ///
     /// Automatic oracle resolution stops once `ledger.timestamp() >= end_time + resolution_timeout`.
+    ///
+    /// **Timestamp semantics:** this duration is in **ledger-time seconds**.  At the
+    /// default of 86 400 s (24 hours) the effective real-world deadline matches
+    /// wall-clock time to within minutes.  Values below 300 s are inadvisable.
+    /// See docs/TIMESTAMP_ASSUMPTIONS.md §10.
     pub resolution_timeout: u64,
     /// Administrative address that created/manages the event
     pub admin: Address,

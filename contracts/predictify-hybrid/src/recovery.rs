@@ -12,13 +12,28 @@ const RECOVERY_LIFETIME_THRESHOLD: u32 = 31 * 17_280;
 
 // ===== PER-MARKET RECOVERY TIMELOCK =====
 
-/// Default timelock delay before a per-market recovery action can be executed (24 hours).
+/// Default delay between initiating and executing a per-market recovery action.
+///
+/// All recovery timelock durations are measured in **ledger-time seconds**
+/// (`env.ledger().timestamp()`).  Under normal Stellar network conditions
+/// ledger time tracks wall-clock time to within a few minutes.  At 24 hours
+/// the effective real-world delay is indistinguishable from the configured
+/// value.  The purpose of the delay is to give admins time to detect and
+/// cancel an erroneous recovery; a slightly shorter effective window due to
+/// ledger-time drift does not reduce that security property.
+/// See docs/TIMESTAMP_ASSUMPTIONS.md §14 for the full analysis.
 pub const DEFAULT_RECOVERY_TIMELOCK_SECONDS: u64 = 24 * 60 * 60;
 
-/// Minimum allowed recovery timelock (1 hour). Prevents setting dangerously short windows.
+/// Minimum allowed recovery timelock (1 hour).
+///
+/// Prevents setting dangerously short windows.  At 1 hour, ledger-time
+/// drift could shorten the effective window by 1–2 minutes but cannot
+/// reduce it to zero.
 pub const MIN_RECOVERY_TIMELOCK_SECONDS: u64 = 60 * 60;
 
-/// Maximum allowed recovery timelock (7 days). Prevents excessively long lockouts.
+/// Maximum allowed recovery timelock (7 days).
+///
+/// Prevents excessively long lockouts that would leave a market stuck.
 pub const MAX_RECOVERY_TIMELOCK_SECONDS: u64 = 7 * 24 * 60 * 60;
 
 /// Specifies the type of recovery action to perform on a market.

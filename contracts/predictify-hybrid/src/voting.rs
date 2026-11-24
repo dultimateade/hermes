@@ -34,9 +34,20 @@ pub const HIGH_ACTIVITY_THRESHOLD: u32 = crate::config::HIGH_ACTIVITY_THRESHOLD;
 /// Platform fee percentage (2%)
 pub const FEE_PERCENTAGE: i128 = crate::config::DEFAULT_PLATFORM_FEE_PERCENTAGE;
 
-/// Dispute extension period in hours
+/// Dispute extension period in hours.
+///
+/// Measured in `env.ledger().timestamp()` seconds once converted
+/// (`DISPUTE_EXTENSION_HOURS * 3600`).  At typical values of several
+/// hours or more, ledger-time drift is negligible.  If this value is
+/// set below 2 hours, consider switching to a ledger-sequence-based
+/// deadline instead (see docs/TIMESTAMP_ASSUMPTIONS.md §13).
 pub const DISPUTE_EXTENSION_HOURS: u32 = crate::config::DISPUTE_EXTENSION_HOURS;
-/// Cooldown between critical admin voting actions.
+
+/// Minimum ledger-time seconds between consecutive admin voting actions.
+///
+/// Measured in `env.ledger().timestamp()` seconds.  At 1 hour, ledger-time
+/// drift could shorten the effective cooldown by 1–2 minutes but cannot
+/// reduce it to zero.  See docs/TIMESTAMP_ASSUMPTIONS.md §1–6.
 pub const ADMIN_ACTION_COOLDOWN_SECS: u64 = 3600;
 // ===== VOTING STRUCTURES =====
 

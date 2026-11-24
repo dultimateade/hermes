@@ -8,7 +8,20 @@ use crate::types::{
 use soroban_sdk::{symbol_short, token, Address, Env, Map, String, Symbol, Vec};
 
 pub const MIN_DISPUTE_STAKE: i128 = 10_000_000;
-pub const DISPUTE_PERIOD_SECS: u64 = 86400;
+
+/// Default dispute challenge period in ledger-time seconds.
+///
+/// Measured in `env.ledger().timestamp()` seconds.  Under normal Stellar
+/// network conditions ledger time tracks wall-clock time to within a few
+/// minutes; at 24 hours the effective real-world window is
+/// indistinguishable from the configured value.
+///
+/// If the per-market `dispute_window_seconds` field is set it overrides
+/// this default.  Values below 3 600 s (1 hour) are inadvisable because
+/// ledger-time drift can represent a meaningful fraction of the window.
+/// For windows below 2 hours, consider using ledger sequence numbers
+/// instead (see docs/TIMESTAMP_ASSUMPTIONS.md §11–12).
+pub const DISPUTE_PERIOD_SECS: u64 = 86_400;
 
 pub struct DisputeValidator;
 

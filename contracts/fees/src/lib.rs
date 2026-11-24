@@ -39,6 +39,15 @@ pub enum FeeWithdrawalStatus {
 }
 
 /// Schedule entry for fee withdrawals.
+///
+/// `next_withdrawal` and `last_withdrawal` are **ledger-time timestamps**
+/// (`env.ledger().timestamp()`).  `cooldown_seconds` is therefore also a
+/// ledger-time duration.  At 24 hours the effective real-world cooldown
+/// is indistinguishable from the configured value.
+///
+/// **Note:** `next_withdrawal` is currently stored but not enforced by
+/// `collect_fees`.  Enforcement should be added before this schedule is
+/// considered a security boundary (see docs/TIMESTAMP_ASSUMPTIONS.md §15).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeWithdrawalSchedule {
@@ -260,6 +269,21 @@ impl FeesContract {
     /// - `ContractError::Unauthorized` if caller is not the admin.
     /// - `ContractError::FeesPaused` if fees are paused.
     /// - `ContractError::BelowCollectionThreshold` if collected fees < threshold.
+    ///
+    /// # Withdrawal cooldown
+    /// A 24-hour ledger-time cooldown (`FeeWithdrawalSchedule::cooldown_seconds`)
+    /// is recorded after each successful collection, but the guard is **not yet
+    /// enforced** — `next_withdrawal` is stored for informational purposes only.
+    /// Before treating this as a security boundary, add an enforcement check:
+    ///
+    /// ```rust,ignore
+    /// let schedule = Self::get_withdrawal_schedule_internal(&env);
+    /// if schedule.last_withdrawal > 0 && now < schedule.next_withdrawal {
+    ///     return Err(ContractError::WithdrawalCooldownActive);
+    /// }
+    /// ```
+    ///
+    /// See docs/TIMESTAMP_ASSUMPTIONS.md §15.
     pub fn collect_fees(env: Env, admin: Address) -> Result<FeeCollectionResult, ContractError> {
         // ---- AUTH: require caller authentication before any state mutation ----
         admin.require_auth();

@@ -61,8 +61,12 @@ pub enum Severity {
 pub const LAST_ADMIN_ACTION: &str = "LAST_ADMIN_ACT";
 
 // 2. Define the cooldown duration (24 hours = 86,400 seconds)
-// For testing purposes, you might want to make this configurable, 
-// but b#009 usually implies a strict window.
+//
+// Measured in ledger-time seconds (`env.ledger().timestamp()`).
+// Under normal Stellar network conditions ledger time tracks wall-clock
+// time to within a few minutes.  At 24 hours the effective real-world
+// cooldown is indistinguishable from the configured value.
+// See docs/TIMESTAMP_ASSUMPTIONS.md §3 for the full analysis.
 pub const COOLDOWN_PERIOD: u64 = 86_400;
 
 /// Internal helper to enforce a wait period between critical admin actions.
@@ -1727,7 +1731,16 @@ impl AdminManager {
 // ===== MULTISIG MANAGER =====
 
 /// Manages multisig/threshold approval for sensitive admin operations
-pub const THRESHOLD_ROTATION_DELAY: u64 = 86400; // 24 hours
+
+/// Minimum ledger-time seconds that must elapse between a threshold-rotation
+/// proposal and its execution.
+///
+/// Measured in `env.ledger().timestamp()` seconds.  At 24 hours the
+/// ledger-time drift is negligible (seconds to low minutes).  The delay
+/// exists to give admins time to detect and cancel an erroneous rotation;
+/// a slightly shorter effective window due to drift does not reduce security.
+/// See docs/TIMESTAMP_ASSUMPTIONS.md §7.
+pub const THRESHOLD_ROTATION_DELAY: u64 = 86_400; // 24 hours
 
 /// Pending threshold update for two-phase commit
 #[derive(Clone, Debug)]
@@ -1965,7 +1978,11 @@ impl MultisigManager {
             initiator: initiator.clone(),
             approvals,
             created_at: env.ledger().timestamp(),
-            expires_at: env.ledger().timestamp() + 86400, // 24 hours
+            // Queued actions expire after 24 ledger-time hours.  Expiry is
+            // checked with `>` (strictly after), so an action submitted on
+            // the last ledger before expiry is still accepted.
+            // See docs/TIMESTAMP_ASSUMPTIONS.md §8.
+            expires_at: env.ledger().timestamp() + 86_400, // 24 hours
             executed: false,
             data,
         };
