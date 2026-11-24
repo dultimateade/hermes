@@ -9,6 +9,7 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  issues: read
 
 jobs:
   changelog:
@@ -67,6 +68,72 @@ jobs:
             echo "✗ CHANGELOG.md does not reference Keep a Changelog format"
             exit 1
           fi
+
+      - name: Validate issue references in changelog entries
+        if: steps.changelog_check.outputs.CHANGELOG_UPDATED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            BASE="$(git rev-parse HEAD^)"
+          fi
+
+          # Extract added lines from the diff of CHANGELOG.md
+          ADDED_LINES=$(git diff "${BASE}...HEAD" -- CHANGELOG.md | grep -E '^\+' | grep -v '^+++' | sed 's/^+//')
+
+          # Track whether we are inside the [Unreleased] section
+          IN_UNRELEASED=0
+          ENTRIES=""
+          while IFS= read -r line; do
+            if echo "$line" | grep -qE '^## \[Unreleased\]'; then
+              IN_UNRELEASED=1
+              continue
+            fi
+            if [ "$IN_UNRELEASED" -eq 1 ] && echo "$line" | grep -qE '^## \[[^]]+\]'; then
+              IN_UNRELEASED=0
+              continue
+            fi
+            if [ "$IN_UNRELEASED" -eq 1 ]; then
+              # Only consider actual entry lines (list items), skip headers/blank lines
+              if echo "$line" | grep -qE '^[[:space:]]*[-*][[:space:]]+'; then
+                ENTRIES="${ENTRIES}${line}"$'\n'
+              fi
+            fi
+          done <<< "$ADDED_LINES"
+
+          if [ -z "$ENTRIES" ]; then
+            echo "::error::No new entries found in the [Unreleased] section of CHANGELOG.md."
+            echo "Please add at least one entry referencing a GitHub issue (e.g. 'Fixed a bug (#123)')."
+            exit 1
+          fi
+
+          FAILED=0
+          while IFS= read -r entry; do
+            [ -z "$entry" ] && continue
+            if ! echo "$entry" | grep -qE '(closes[[:space:]]+)?#[0-9]+'; then
+              echo "::error::CHANGELOG entry is missing an issue reference (#NNN): ${entry}"
+              FAILED=1
+              continue
+            fi
+            # Extract all referenced issue numbers and verify they exist
+            for num in $(echo "$entry" | grep -oE '#[0-9]+' | tr -d '#'); do
+              if ! gh api "repos/${{ github.repository }}/issues/${num}" >/dev/null 2>&1; then
+                echo "::error::CHANGELOG entry references issue #${num} which does not exist in this repository: ${entry}"
+                FAILED=1
+              fi
+            done
+          done <<< "$ENTRIES"
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "Each CHANGELOG entry in the [Unreleased] section must reference a valid GitHub issue."
+            echo "Use the format '#NNN' or 'closes #NNN', e.g.:"
+            echo "  - **markets**: Corrected fee calculation in place_bet (#123)"
+            exit 1
+          fi
+
+          echo "✓ All CHANGELOG entries reference valid issues"
 
       - name: Require CHANGELOG.md update
         if: steps.changelog_check.outputs.CHANGELOG_UPDATED == 'false'
