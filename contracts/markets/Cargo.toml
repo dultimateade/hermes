@@ -3,6 +3,7 @@ name = "markets"
 version = "0.0.0"
 edition = "2021"
 publish = false
+autotests = false
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -10,6 +11,22 @@ doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+
+[[test]]
+name = "auth_boundary"
+path = "tests/auth_boundary.rs"
+
+[[test]]
+name = "admin_cooldown"
+path = "tests/admin_cooldown.rs"
+
+[[test]]
+name = "proptest"
+path = "tests/proptest.rs"
+
+[[test]]
+name = "issues_007_012_014_022"
+path = "tests/issues_007_012_014_022.rs"
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

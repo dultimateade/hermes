@@ -1,0 +1,10 @@
+commit_out.txt
+.git_commit_msg.txt
+commit_and_push.ps1
+commit.sh
+
+# Rust build artifacts
+target/
+*.rs.bk
+/contracts/oracles/test_snapshots/
+/full_structure3.txt

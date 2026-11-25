@@ -3,6 +3,7 @@ name = "reporting"
 version = "0.1.0"
 edition = "2021"
 publish = false
+autotests = false
 
 [lib]
 crate-type = ["lib", "cdylib"]
@@ -15,8 +16,24 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [[test]]
-name = "auth_boundary"
-path = "tests/auth_boundary.rs"
+name = "auth_submit"
+path = "tests/auth_submit.rs"
+
+[[test]]
+name = "auth_verify"
+path = "tests/auth_verify.rs"
+
+[[test]]
+name = "auth_dispute"
+path = "tests/auth_dispute.rs"
+
+[[test]]
+name = "auth_admin"
+path = "tests/auth_admin.rs"
+
+[[test]]
+name = "market_reports_index"
+path = "tests/market_reports_index.rs"
 
 [[test]]
 name = "pause_behavior"

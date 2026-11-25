@@ -1,39 +1,49 @@
 //! Per-entrypoint Soroban CPU and memory regression snapshots.
 //!
 //! Each snapshot isolates one public call and compares its measured mock-host
-//! budget delta with a checked-in baseline. CI permits at most a 5% increase:
-//! `limit = baseline + ceil(baseline / 20)`. Setup work is deliberately
+//! budget delta with thresholds checked into `benches/thresholds.json`.
+//! CI permits at most a 5% increase:
+//! `limit = threshold + ceil(threshold / 20)`. Setup work is deliberately
 //! completed before the budget reset so unrelated fixture costs cannot hide an
 //! entrypoint regression.
 
 use migrate::{ContractError, MigrateContract, MigrateContractClient};
 use soroban_sdk::{testutils::Address as _, Address, Env};
+use std::collections::HashMap;
 
 #[derive(Copy, Clone)]
-struct Baseline {
-    cpu: u64,
-    memory: u64,
+struct Threshold {
+    max_cpu_insns: u64,
+    max_mem_bytes: u64,
 }
 
-// Baselines measured with soroban-sdk 25.3.1 and a reset unlimited budget.
-const INITIALIZE: Baseline = Baseline {
-    cpu: 55_643,
-    memory: 20_337,
-};
-const MIGRATE: Baseline = Baseline {
-    cpu: 69_405,
-    memory: 22_409,
-};
-// Admin-facing reads are intentionally given a small buffer over the current
-// host measurement so minor SDK/host variance does not trip the 5% guard.
-const ADMIN: Baseline = Baseline {
-    cpu: 32_500,
-    memory: 13_000,
-};
-const CURRENT_VERSION: Baseline = Baseline {
-    cpu: 32_500,
-    memory: 13_000,
-};
+fn load_thresholds() -> HashMap<String, Threshold> {
+    const RAW: &str = include_str!("../benches/thresholds.json");
+    let doc: serde_json::Value =
+        serde_json::from_str(RAW).expect("benches/thresholds.json must be valid JSON");
+    let entries = doc["thresholds"]
+        .as_object()
+        .expect("thresholds.json must have a 'thresholds' object");
+
+    entries
+        .iter()
+        .map(|(name, value)| {
+            let cpu = value["max_cpu_insns"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("threshold '{name}' missing max_cpu_insns"));
+            let memory = value["max_mem_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("threshold '{name}' missing max_mem_bytes"));
+            (
+                name.clone(),
+                Threshold {
+                    max_cpu_insns: cpu,
+                    max_mem_bytes: memory,
+                },
+            )
+        })
+        .collect()
+}
 
 fn measured_budget(env: &Env) -> (u64, u64) {
     let budget = env.cost_estimate().budget();
@@ -51,9 +61,9 @@ fn five_percent_ceiling(baseline: u64) -> u64 {
         .expect("gas baseline must leave room for its 5% regression margin")
 }
 
-fn assert_budget(label: &str, measured: (u64, u64), baseline: Baseline) {
-    let cpu_limit = five_percent_ceiling(baseline.cpu);
-    let memory_limit = five_percent_ceiling(baseline.memory);
+fn assert_budget(label: &str, measured: (u64, u64), threshold: &Threshold) {
+    let cpu_limit = five_percent_ceiling(threshold.max_cpu_insns);
+    let memory_limit = five_percent_ceiling(threshold.max_mem_bytes);
 
     println!(
         "{label}: cpu={}, memory={}, cpu_limit={cpu_limit}, memory_limit={memory_limit}",
@@ -61,18 +71,27 @@ fn assert_budget(label: &str, measured: (u64, u64), baseline: Baseline) {
     );
     assert!(
         measured.0 <= cpu_limit,
-        "{label}: CPU regression exceeds 5%: measured {}, baseline {}, limit {}",
+        "{label}: CPU regression exceeds 5%: measured {}, threshold {}, limit {}",
         measured.0,
-        baseline.cpu,
+        threshold.max_cpu_insns,
         cpu_limit
     );
     assert!(
         measured.1 <= memory_limit,
-        "{label}: memory regression exceeds 5%: measured {}, baseline {}, limit {}",
+        "{label}: memory regression exceeds 5%: measured {}, threshold {}, limit {}",
         measured.1,
-        baseline.memory,
+        threshold.max_mem_bytes,
         memory_limit
     );
+}
+
+fn threshold<'a>(
+    thresholds: &'a HashMap<String, Threshold>,
+    name: &str,
+) -> &'a Threshold {
+    thresholds
+        .get(name)
+        .unwrap_or_else(|| panic!("thresholds.json is missing required key '{name}'"))
 }
 
 struct Fixture {
@@ -107,12 +126,13 @@ impl Fixture {
 fn snapshot_initialize() {
     let fixture = Fixture::new();
     let client = fixture.client();
+    let thresholds = load_thresholds();
 
     reset_budget(&fixture.env);
     client.initialize(&fixture.admin, &1);
     let measured = measured_budget(&fixture.env);
 
-    assert_budget("initialize", measured, INITIALIZE);
+    assert_budget("initialize", measured, threshold(&thresholds, "initialize"));
 }
 
 #[test]
@@ -120,13 +140,14 @@ fn snapshot_migrate() {
     let fixture = Fixture::new();
     fixture.initialize(1);
     let client = fixture.client();
+    let thresholds = load_thresholds();
 
     reset_budget(&fixture.env);
     client.migrate(&fixture.admin, &1, &2);
     let measured = measured_budget(&fixture.env);
 
     assert_eq!(client.current_version(), 2);
-    assert_budget("migrate", measured, MIGRATE);
+    assert_budget("migrate", measured, threshold(&thresholds, "migrate"));
 }
 
 #[test]
@@ -134,13 +155,14 @@ fn snapshot_admin() {
     let fixture = Fixture::new();
     fixture.initialize(1);
     let client = fixture.client();
+    let thresholds = load_thresholds();
 
     reset_budget(&fixture.env);
     let stored_admin = client.admin();
     let measured = measured_budget(&fixture.env);
 
     assert_eq!(stored_admin, fixture.admin);
-    assert_budget("admin", measured, ADMIN);
+    assert_budget("admin", measured, threshold(&thresholds, "admin"));
 }
 
 #[test]
@@ -148,13 +170,18 @@ fn snapshot_current_version() {
     let fixture = Fixture::new();
     fixture.initialize(7);
     let client = fixture.client();
+    let thresholds = load_thresholds();
 
     reset_budget(&fixture.env);
     let current_version = client.current_version();
     let measured = measured_budget(&fixture.env);
 
     assert_eq!(current_version, 7);
-    assert_budget("current_version", measured, CURRENT_VERSION);
+    assert_budget(
+        "current_version",
+        measured,
+        threshold(&thresholds, "current_version"),
+    );
 }
 
 #[test]

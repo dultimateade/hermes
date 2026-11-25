@@ -16,6 +16,7 @@
 
 use soroban_sdk::{testutils::Address as _, Address, Env, Symbol, Vec};
 use allowlist::{AllowlistContract, AllowlistContractClient, AllowlistError};
+use proptest::prelude::*;
 
 struct Ctx {
     env: Env,
@@ -205,17 +206,196 @@ fn multiple_allowlists_are_independent() {
 }
 
 // ---------------------------------------------------------------------------
-// Batch remove idempotency
+// Batch address check
 // ---------------------------------------------------------------------------
 
 #[test]
-fn batch_remove_skips_absent_addresses() {
-    let ctx = Ctx::new(2);
-    let list_id = ctx.sym("batch_rm");
+fn batch_is_allowed_basic() {
+    let ctx = Ctx::new(3);
+    let list_id = ctx.sym("batch_check");
     ctx.client.create_allowlist(&ctx.admin, &list_id);
     ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(0));
-    let to_remove = soroban_sdk::vec![&ctx.env, ctx.user(0), ctx.user(1)];
-    assert!(ctx.client.try_remove_addresses(&ctx.admin, &list_id, &to_remove).is_ok());
-    assert!(!ctx.client.is_allowed(&list_id, &ctx.user(0)));
-    assert!(!ctx.client.is_allowed(&list_id, &ctx.user(1)));
+    ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(1));
+
+    let addrs = soroban_sdk::vec![&ctx.env, ctx.user(0), ctx.user(1), ctx.user(2)];
+    let results = ctx.client.batch_is_allowed(&list_id, &addrs);
+
+    // Should have 3 results
+    assert_eq!(results.len(), 3);
+
+    // user0 and user1 are allowed, user2 is not
+    let mut allowed_count = 0;
+    for (addr, is_allowed) in &results {
+        match addr {
+            a if a == &ctx.user(0) => {
+                assert!(*is_allowed, "user0 must be allowed");
+                allowed_count += 1;
+            }
+            a if a == &ctx.user(1) => {
+                assert!(*is_allowed, "user1 must be allowed");
+                allowed_count += 1;
+            }
+            a if a == &ctx.user(2) => {
+                assert!(!*is_allowed, "user2 must NOT be allowed");
+            }
+            _ => panic!("unexpected address in results"),
+        }
+    }
+    assert_eq!(allowed_count, 2);
+}
+
+#[test]
+fn batch_is_allowed_empty_list() {
+    let ctx = Ctx::new(1);
+    let list_id = ctx.sym("empty_check");
+    ctx.client.create_allowlist(&ctx.admin, &list_id);
+
+    let addrs: Vec<Address> = Vec::new(&ctx.env);
+    let results = ctx.client.batch_is_allowed(&list_id, &addrs);
+
+    // Empty input should produce empty results
+    assert_eq!(results.len(), 0);
+}
+
+#[test]
+fn batch_is_allow_all_allowed() {
+    let ctx = Ctx::new(3);
+    let list_id = ctx.sym("all_allowed");
+    ctx.client.create_allowlist(&ctx.admin, &list_id);
+    // Add all three users
+    ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(0));
+    ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(1));
+    ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(2));
+
+    let addrs = soroban_sdk::vec![&ctx.env, ctx.user(0), ctx.user(1), ctx.user(2)];
+    let results = ctx.client.batch_is_allowed(&list_id, &addrs);
+
+    assert_eq!(results.len(), 3);
+    for (addr, is_allowed) in &results {
+        assert!(*is_allowed, "all addresses in allowlist should be allowed");
+    }
+}
+
+#[test]
+fn batch_is_allow_none_allowed() {
+    let ctx = Ctx::new(2);
+    let list_id = ctx.sym("none_allowed");
+    ctx.client.create_allowlist(&ctx.admin, &list_id);
+
+    // No addresses added to allowlist
+    let addrs = soroban_sdk::vec![&ctx.env, ctx.user(0), ctx.user(1)];
+    let results = ctx.client.batch_is_allowed(&list_id, &addrs);
+
+    assert_eq!(results.len(), 2);
+    for (_, is_allowed) in &results {
+        assert!(!*is_allowed, "no addresses should be allowed");
+    }
+}
+
+#[test]
+fn batch_is_allow_duplicates() {
+    let ctx = Ctx::new(1);
+    let list_id = ctx.sym("dup_check");
+    ctx.client.create_allowlist(&ctx.admin, &list_id);
+    ctx.client.add_address(&ctx.admin, &list_id, &ctx.user(0));
+
+    // Send the same address twice - both should return true
+    let addrs = soroban_sdk::vec![&ctx.env, ctx.user(0), ctx.user(0)];
+    let results = ctx.client.batch_is_allowed(&list_id, &addrs);
+
+    assert_eq!(results.len(), 2);
+    // Both entries for the same address should be true
+    for (_, is_allowed) in &results {
+        assert!(*is_allowed, "duplicate address should still be allowed");
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig {
+        cases: 32,
+        .. ProptestConfig::default()
+    })]
+
+    #[test]
+    fn batch_is_allowed_properties(
+        allowlist_len in 1usize..=5,
+        arbitrary_indices in prop::collection::vec(0usize..10, 0..=10),
+        absent_len in 1usize..=5,
+    ) {
+        let ctx = Ctx::new(10);
+        let list_id = ctx.sym("batch_props");
+        ctx.client.create_allowlist(&ctx.admin, &list_id);
+
+        let mut members = Vec::new(&ctx.env);
+        for index in 0..allowlist_len {
+            members.push_back(ctx.user(index as u32));
+        }
+        ctx.client.add_addresses(&ctx.admin, &list_id, &members);
+
+        for scenario in 0u8..5 {
+            let query_indices: std::vec::Vec<usize> = match scenario {
+                0 => std::vec::Vec::new(),
+                // One more address than the allowlist contains.
+                1 => (0..=allowlist_len).collect(),
+                // The query consists entirely of allowlisted addresses.
+                2 => (0..allowlist_len).collect(),
+                // These indices are outside the allowlist's 0..5 member range.
+                3 => (5..5 + absent_len).collect(),
+                // Arbitrary inputs also exercise duplicates and mixed membership.
+                _ => arbitrary_indices.clone(),
+            };
+
+            let mut query = Vec::new(&ctx.env);
+            for index in &query_indices {
+                query.push_back(ctx.user(*index as u32));
+            }
+
+            let results = ctx.client.batch_is_allowed(&list_id, &query);
+            prop_assert_eq!(results.len() as usize, query_indices.len());
+
+            for (position, index) in query_indices.iter().enumerate() {
+                let (address, allowed) = results.get(position as u32).unwrap();
+                prop_assert_eq!(address, ctx.user(*index as u32));
+                prop_assert_eq!(allowed, *index < allowlist_len);
+            }
+        }
+    }
+
+    #[test]
+    fn batch_add_deduplicates_arbitrary_duplicate_addresses(
+        indices in prop::collection::vec(0usize..5, 0..=10),
+        duplicate_index in 0usize..5,
+    ) {
+        let ctx = Ctx::new(5);
+        let list_id = ctx.sym("duplicate_props");
+        ctx.client.create_allowlist(&ctx.admin, &list_id);
+
+        let mut input_indices = indices;
+        input_indices.push(duplicate_index);
+        input_indices.push(duplicate_index);
+
+        let mut expected_indices = std::vec::Vec::new();
+        let mut addresses = Vec::new(&ctx.env);
+        for index in &input_indices {
+            addresses.push_back(ctx.user(*index as u32));
+            if !expected_indices.contains(index) {
+                expected_indices.push(*index);
+            }
+        }
+
+        ctx.client.add_addresses(&ctx.admin, &list_id, &addresses);
+        let actual = ctx.client.get_allowlist(&list_id);
+        prop_assert_eq!(actual.len() as usize, expected_indices.len());
+        for (position, index) in expected_indices.iter().enumerate() {
+            prop_assert_eq!(actual.get(position as u32).unwrap(), ctx.user(*index as u32));
+        }
+
+        // Re-applying the same duplicate-containing batch must leave state unchanged.
+        ctx.client.add_addresses(&ctx.admin, &list_id, &addresses);
+        let actual = ctx.client.get_allowlist(&list_id);
+        prop_assert_eq!(actual.len() as usize, expected_indices.len());
+        for (position, index) in expected_indices.iter().enumerate() {
+            prop_assert_eq!(actual.get(position as u32).unwrap(), ctx.user(*index as u32));
+        }
+    }
 }

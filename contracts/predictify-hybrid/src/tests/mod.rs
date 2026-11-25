@@ -46,3 +46,6 @@ pub mod disputes_gas_snap;
 /// boundary conditions around `end_time`, and verifies the error metadata
 /// (code, description, string code).
 pub mod market_closed_tests;
+
+/// Creator-gated question edits before any stake is committed (issue #004).
+pub mod update_market_question_tests;

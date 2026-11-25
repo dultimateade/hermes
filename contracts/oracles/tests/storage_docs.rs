@@ -1,7 +1,7 @@
 const STORAGE_DOCUMENTATION: &str = include_str!("../docs/storage.md");
 
 #[test]
-fn storage_documentation_covers_all_storage_tiers_and_registry_key() {
+fn storage_documentation_covers_storage_tiers_and_result_ttl() {
     for required_section in ["Instance", "Persistent", "Temporary"] {
         assert!(
             STORAGE_DOCUMENTATION.contains(required_section),
@@ -18,7 +18,16 @@ fn storage_documentation_covers_all_storage_tiers_and_registry_key() {
         "storage documentation must describe the registry value"
     );
     assert!(
-        STORAGE_DOCUMENTATION.contains("does not change the contract's public API"),
-        "storage documentation must state the API impact"
+        STORAGE_DOCUMENTATION.contains("DataKey::MarketResult(market_id, oracle_address)"),
+        "storage documentation must describe the MarketResult key structure"
+    );
+    assert!(
+        STORAGE_DOCUMENTATION.contains("6_307_200"),
+        "storage documentation must specify the one-year market result TTL"
+    );
+    assert!(
+        STORAGE_DOCUMENTATION.contains("submit_market_result")
+            && STORAGE_DOCUMENTATION.contains("get_result"),
+        "storage documentation must describe market result submission and reads"
     );
 }

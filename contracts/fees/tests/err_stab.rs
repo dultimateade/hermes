@@ -14,6 +14,9 @@ fn test_fees_error_stability() {
     assert_eq!(ContractError::FeeConfigNotFound as u32, 7);
     assert_eq!(ContractError::FeePercentageTooHigh as u32, 8);
     assert_eq!(ContractError::BelowCollectionThreshold as u32, 9);
+    assert_eq!(ContractError::NoPendingFeeCommit as u32, 10);
+    assert_eq!(ContractError::FeeRevealTooEarly as u32, 11);
+    assert_eq!(ContractError::FeeApplyTooEarly as u32, 12);
 }
 
 /// Ensure all variants are covered by the match.
@@ -30,6 +33,10 @@ fn test_all_variants_accounted_for() {
         ContractError::FeeConfigNotFound,
         ContractError::FeePercentageTooHigh,
         ContractError::BelowCollectionThreshold,
+        ContractError::NoPendingFeeCommit,
+        ContractError::FeePreimageMismatch,
+        ContractError::FeeRevealTooEarly,
+        ContractError::FeeApplyTooEarly,
     ];
-    assert_eq!(errors.len(), 9, "All 9 variants must be listed");
+    assert_eq!(errors.len(), 12, "All 12 variants must be listed");
 }

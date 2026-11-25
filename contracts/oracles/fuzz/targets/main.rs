@@ -3,9 +3,9 @@
 use libfuzzer_sys::fuzz_target;
 use soroban_sdk::{
     contract, contractimpl, Address, Env, String as SorobanString, Vec as SorobanVec,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
 };
-use oracles::{OraclesContract, OraclesContractClient, OraclePriceData};
+use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient, OraclePriceData};
 
 /// A mock oracle contract whose behavior is dynamically configurable via instances storage.
 #[contract]
@@ -13,6 +13,10 @@ pub struct FuzzMockOracle;
 
 #[contractimpl]
 impl FuzzMockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     /// Retrieve the current price, panicking if configured to fail.
     pub fn get_price(env: Env, _feed_id: SorobanString) -> i128 {
         if env.storage().instance().get(&soroban_sdk::symbol_short!("panic")).unwrap_or(false) {
@@ -84,6 +88,25 @@ fuzz_target!(|data: &[u8]| {
     for _ in 0..5 {
         oracle_addresses.push_back(env.register_contract(None, FuzzMockOracle));
     }
+
+    // Always exercise the stale-publication rejection before fuzzed actions.
+    env.ledger().with_mut(|ledger| ledger.timestamp = 7_200);
+    let stale_oracle = oracle_addresses.get(0).unwrap();
+    client.add_oracle(&admin, &stale_oracle);
+    env.as_contract(&stale_oracle, || {
+        env.storage().instance().set(&soroban_sdk::symbol_short!("price"), &100i128);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("time"), &0u64);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("live"), &true);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("panic"), &false);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("panic_pd"), &false);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("conf"), &None::<i128>);
+        env.storage().instance().set(&soroban_sdk::symbol_short!("exp"), &0i32);
+    });
+    let stale_feed = SorobanString::from_str(&env, "BTC/USD");
+    assert_eq!(
+        client.try_get_price_data(&stale_oracle, &stale_feed),
+        Err(Ok(Error::OracleStale))
+    );
 
     let mut idx = 0;
     while idx < data.len() {
@@ -191,7 +214,8 @@ fuzz_target!(|data: &[u8]| {
                     Address::generate(&env)
                 };
 
-                let _ = client.is_oracle_healthy(&oracle_addr);
+                let health_feed = SorobanString::from_str(&env, "BTC/USD");
+                let _ = client.is_oracle_healthy(&oracle_addr, &health_feed);
             }
             _ => unreachable!(),
         }

@@ -14,9 +14,13 @@ predictify-hybrid = { path = ".." }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 
 [[bin]]
-name = "resolution"
-path = "targets/resolution.rs"
+name = "market_lifecycle"
+path = "targets/market_lifecycle.rs"
 
 [[bin]]
-name = "resolve"
-path = "targets/resolve.rs"
+name = "betting_payout"
+path = "targets/betting_payout.rs"
+
+[[bin]]
+name = "dispute_escalation"
+path = "targets/dispute_escalation.rs"

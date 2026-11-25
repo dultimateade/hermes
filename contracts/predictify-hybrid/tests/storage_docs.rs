@@ -1,5 +1,33 @@
 const STORAGE_DOCUMENTATION: &str = include_str!("../docs/storage.md");
 
+const DATA_KEY_VARIANTS: &[&str] = &[
+    "PlaceBetsIdem",
+    "Whitelisted",
+    "Blacklisted",
+    "ArchivedMarket",
+    "MarketExtensionTotal",
+    "MarketMetadata",
+    "MarketScratch",
+    "DisputeHistoryCap",
+    "DisputeHistory",
+    "DisputeStakeCap",
+    "DisputeCumulativeStakeCap",
+    "MarketCache",
+    "AntiGriefFloor",
+    "DisputeCooldownSeconds",
+    "DisputeAdminLastAction",
+    "ResolutionCooldownSeconds",
+    "ResolutionAdminLastAction",
+    "GlobalConfig",
+    "EventNonce",
+    "UserStake",
+    "MaxBetCap",
+    "UserLastBetTime",
+    "CoolOffPeriod",
+    "PerMarketCoolOff",
+    "MaxOutcomesPerMarket",
+];
+
 #[test]
 fn storage_documentation_covers_all_storage_tiers_and_recovery_keys() {
     for required_section in ["Instance", "Persistent", "Temporary"] {
@@ -107,5 +135,42 @@ fn storage_documentation_covers_all_storage_tiers_and_recovery_keys() {
     assert!(
         STORAGE_DOCUMENTATION.contains("does not change the contract's public API"),
         "storage documentation must state the API impact"
+    );
+}
+
+#[test]
+fn storage_documentation_covers_every_data_key_variant() {
+    for variant in DATA_KEY_VARIANTS {
+        assert!(
+            STORAGE_DOCUMENTATION.contains(variant),
+            "storage documentation must document DataKey::{variant}"
+        );
+    }
+}
+
+#[test]
+fn storage_documentation_covers_ad_hoc_keys_and_ttl_tiers() {
+    for required in [
+        "storage_config",
+        "\"Balance\"",
+        "\"Event\"",
+        "\"ActiveEvents\"",
+        "BALANCE_TTL_LEDGERS",
+        "MARKET_TTL_LEDGERS",
+        "EVENT_TTL_LEDGERS",
+        "ARCHIVE_TTL_LEDGERS",
+    ] {
+        assert!(
+            STORAGE_DOCUMENTATION.contains(required),
+            "storage documentation must cover {required}"
+        );
+    }
+}
+
+#[test]
+fn storage_documentation_flags_known_inconsistencies() {
+    assert!(
+        STORAGE_DOCUMENTATION.contains("MarketLeaderboard"),
+        "storage documentation must flag the MarketLeaderboard inconsistency"
     );
 }

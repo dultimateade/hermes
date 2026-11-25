@@ -13,7 +13,13 @@ soroban-sdk = { workspace = true }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+markets = { path = "../markets" }
+serde_json = { workspace = true }
 
 [[test]]
 name = "error_tests"
 path = "tests/error_tests.rs"
+
+[[test]]
+name = "init_validation_tests"
+path = "tests/init_validation_tests.rs"

@@ -172,13 +172,34 @@ pub fn get_subscription_count(env: &Env, user: &Address) -> u32 {
         .unwrap_or(0)
 }
 
-/// Build an [`AccountState`] snapshot for `user`.
-pub fn load_account_state(env: &Env, user: &Address) -> AccountState {
-    AccountState {
+/// Build an [`AccountState`] snapshot for `user`, or `None` if the account
+/// has never interacted with the contract.
+///
+/// An account is considered tracked once any of its three per-resource
+/// counters has been written at least once (i.e. once `record_*` has been
+/// called successfully).  Checking for the presence of any persistent storage
+/// key avoids a dedicated "seen" sentinel and adds no overhead to write paths.
+///
+/// Returns `None` for accounts that have never called `record_bet`,
+/// `record_position`, or `record_subscription`.
+pub fn load_account_state(env: &Env, user: &Address) -> Option<AccountState> {
+    let bet_key = DataKey::BetCount(user.clone());
+    let pos_key = DataKey::PositionCount(user.clone());
+    let sub_key = DataKey::SubscriptionCount(user.clone());
+
+    let tracked = env.storage().persistent().has(&bet_key)
+        || env.storage().persistent().has(&pos_key)
+        || env.storage().persistent().has(&sub_key);
+
+    if !tracked {
+        return None;
+    }
+
+    Some(AccountState {
         bets: get_bet_count(env, user),
         positions: get_position_count(env, user),
         subscriptions: get_subscription_count(env, user),
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

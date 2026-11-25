@@ -6,8 +6,12 @@
 //!
 //! 1. They use a frozen, ≤9-character [`Symbol`] **topic** suitable for the
 //!    `symbol_short!` macro.
-//! 2. They carry a `schema_version: u32` field (frozen at `1` for v1) so
-//!    indexers can route on `(topic, schema_version)`.
+//! 2. The deployment-wide `schema_version` (frozen at `1` for v1) is encoded
+//!    **once** in the contract instance record under [`NS_SCHEMA`] and read
+//!    back through [`BettingEventSchema::deployment_schema_version`].  It is
+//!    deliberately *not* repeated inside every emitted event, which keeps the
+//!    per-event topic cost limited to the values that actually vary between
+//!    events of the same kind.
 //! 3. They carry a monotonically-incrementing `nonce: u64` per topic,
 //!    persisted in instance storage and returned in each event payload.
 //! 4. They carry the Soroban ledger `timestamp: u64` at emission.
@@ -33,10 +37,17 @@
 //! # Topic + schema registry
 //!
 //! [`BettingEventSchema::get_schema`] maps the public logical event
-//! name -> `(topic, schema_version)`.  This indirection means a future
-//! schema bump can change both the topic symbol and the version number
-//! atomically — indexers reading the registry can depalettise entries
-//! without code changes.
+//! name -> `(topic, schema_version)`.  The `topic` is emitted as the
+//! first element of every publish topic tuple; the `schema_version` is
+//! the value that is stored once in the contract instance record (see
+//! [`BettingEventSchema::ensure_schema_record`]), so a schema bump stays
+//! a single-write operation instead of a per-event payload change.
+//!
+//! # Instance record
+//!
+//! | key                     | value                             | written            |
+//! |-------------------------|-----------------------------------|--------------------|
+//! | `(NS_SCHEMA, "ver")`    | `BETTING_EVENT_SCHEMA_VERSION`    | first emit / init  |
 //!
 
 extern crate alloc;
@@ -47,6 +58,15 @@ use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol, Vec}
 /// nonce counter.  Frozen: never change without a
 /// `BettingEventSchema` version bump.
 pub const NS_NONCE: Symbol = symbol_short!("BtNgNs");
+
+/// Reserved namespace prefix used inside the instance record for the
+/// deployment-wide event schema version.  Frozen: never change without
+/// a `BettingEventSchema` version bump.
+pub const NS_SCHEMA: Symbol = symbol_short!("BtNgSv");
+
+/// Suffix of the `(NS_SCHEMA, suffix)` instance-record key that holds the
+/// deployment-wide event schema version.
+const SCHEMA_RECORD_SUFFIX: Symbol = symbol_short!("ver");
 
 /// Default schema version baked into v1 of this module.  Frozen:
 /// bumping `1 -> 2` is a deliberate ABI break and must be advertised
@@ -227,6 +247,11 @@ pub struct BetStatsUpdatedEvent {
 // §4  Schema registry
 // ===================================================================
 
+/// Storage key used to persist the deployed schema version record.
+/// Frozen: changing this key would break any indexer that reads the
+/// deployment version from storage.
+const SCHEMA_RECORD_KEY: Symbol = symbol_short!("BtSchRec");
+
 /// Schema registry: maps a stable logical event name to its
 /// `(topic, schema_version)` pair at the current contract revision.
 ///
@@ -245,6 +270,41 @@ pub struct BetStatsUpdatedEvent {
 pub struct BettingEventSchema;
 
 impl BettingEventSchema {
+    /// Write the deployment schema version into instance storage so that
+    /// [`deployment_schema_version`] returns `Some(BETTING_EVENT_SCHEMA_VERSION)`
+    /// for every deployment that calls this during initialization.
+    ///
+    /// This method is idempotent: calling it more than once simply overwrites
+    /// the record with the same value.  It MUST be called from the contract's
+    /// `init` entrypoint so that indexers can immediately read the schema
+    /// version after deployment without having to wait for the first event.
+    ///
+    /// # Protocol invariant
+    ///
+    /// Any deployment that does not call this function will return `None` from
+    /// [`deployment_schema_version`], breaking indexers that rely on schema
+    /// versioning.  This is considered a deployment error.
+    pub fn ensure_schema_record(env: &Env) {
+        env.storage()
+            .instance()
+            .set(&SCHEMA_RECORD_KEY, &BETTING_EVENT_SCHEMA_VERSION);
+        env.storage()
+            .instance()
+            .extend_ttl(crate::INSTANCE_TTL_LEDGERS, crate::INSTANCE_TTL_LEDGERS);
+    }
+
+    /// Read back the schema version that was written by
+    /// [`ensure_schema_record`].
+    ///
+    /// Returns `None` when the contract was deployed without calling
+    /// `ensure_schema_record` (i.e. the init entrypoint was never invoked or
+    /// was an older version that predates this call).  Indexers MUST treat
+    /// `None` as an unversioned / legacy deployment and MAY refuse to index
+    /// events from such a deployment.
+    pub fn deployment_schema_version(env: &Env) -> Option<u32> {
+        env.storage().instance().get(&SCHEMA_RECORD_KEY)
+    }
+
     /// Look up the [`BettingEventSchemaEntry`] for a logical event name.
     ///
     /// # Arguments
@@ -276,6 +336,66 @@ impl BettingEventSchema {
             }),
             _ => None,
         }
+    }
+
+    /// Build the tuple `(Symbol, Symbol)` storage key of the
+    /// deployment-wide schema-version record inside the contract
+    /// instance record.
+    ///
+    /// The key is `(NS_SCHEMA, "ver")` so it can never collide with the
+    /// per-topic nonce counters kept under `(NS_NONCE, topic)`.
+    pub fn schema_record_key() -> (Symbol, Symbol) {
+        (NS_SCHEMA, SCHEMA_RECORD_SUFFIX)
+    }
+
+    /// Encode the deployment-wide schema version **once** in the
+    /// contract instance record, returning the effective version.
+    ///
+    /// The version is static for the lifetime of a deployment, so
+    /// repeating it inside every emitted event would burn the same few
+    /// bytes on every call.  Writing it here keeps a single authoritative
+    /// copy that indexers read once and reuse for every event they decode.
+    ///
+    /// # Idempotence
+    ///
+    /// The first call writes `BETTING_EVENT_SCHEMA_VERSION` and extends
+    /// the instance TTL; every later call is a pure read.  A pre-existing
+    /// value is never overwritten, so a deployment that already recorded a
+    /// version keeps it across upgrades.
+    ///
+    /// # Panics
+    /// This function never panics.
+    pub fn ensure_schema_record(env: &Env) -> u32 {
+        let key = Self::schema_record_key();
+        match env.storage().instance().get::<(Symbol, Symbol), u32>(&key) {
+            Some(version) => version,
+            None => {
+                env.storage()
+                    .instance()
+                    .set(&key, &BETTING_EVENT_SCHEMA_VERSION);
+                env.storage().instance().extend_ttl(
+                    crate::INSTANCE_TTL_LEDGERS,
+                    crate::INSTANCE_TTL_LEDGERS,
+                );
+                BETTING_EVENT_SCHEMA_VERSION
+            }
+        }
+    }
+
+    /// Read the deployment-wide schema version from the contract
+    /// instance record.
+    ///
+    /// Falls back to [`BETTING_EVENT_SCHEMA_VERSION`] when the record has
+    /// not been written yet (a deployment that only ever read state), so
+    /// the v1 value stays authoritative for legacy deployments.
+    ///
+    /// # Panics
+    /// This function never panics.
+    pub fn deployment_schema_version(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get::<(Symbol, Symbol), u32>(&Self::schema_record_key())
+            .unwrap_or(BETTING_EVENT_SCHEMA_VERSION)
     }
 }
 
@@ -334,7 +454,13 @@ impl BettingEventEmitter {
     /// Stamp common fields: produce the
     /// `(nonce, timestamp)` pair that gets embedded in every event
     /// payload.
+    ///
+    /// Also makes sure the deployment-wide schema version is present in
+    /// the contract instance record.  That record is written once and
+    /// read afterwards, so the version is encoded **once per deployment**
+    /// rather than repeated in the topics of every emitted event.
     fn stamp(env: &Env, topic: Symbol) -> (u64, u64) {
+        BettingEventSchema::ensure_schema_record(env);
         let ts = env.ledger().timestamp();
         let nonce = next_nonce(env, topic);
         (nonce, ts)
@@ -356,7 +482,9 @@ impl BettingEventEmitter {
     ///
     /// # Publishes
     ///
-    /// `(TOPIC_BET_CREATED, market_id, schema_version=1)` → event.
+    /// `(TOPIC_BET_CREATED, market_id)` → event.  The schema version is
+    /// read once from the instance record instead of being repeated in
+    /// every topic tuple.
     pub fn emit_bet_created(
         env: &Env,
         market_id: &Symbol,
@@ -375,19 +503,17 @@ impl BettingEventEmitter {
             nonce,
             timestamp: ts,
         };
-        env.events().publish(
-            (TOPIC_BET_CREATED, market_id.clone(), BETTING_EVENT_SCHEMA_VERSION),
-            event,
-        );
+        env.events().publish((TOPIC_BET_CREATED, market_id.clone()), event);
     }
 
     /// Emit a [`BetBatchCreatedEvent`] for a successful batch placement.
     ///
     /// # Publishes
     ///
-    /// `(TOPIC_BET_BATCH_CREATED, bettor, schema_version=1)` → event.
-    /// Note the second topic element is the bettor (not the market,
-    /// because the batch may span many markets).
+    /// `(TOPIC_BET_BATCH_CREATED, bettor)` → event.  Note the second
+    /// topic element is the bettor (not the market, because the batch may
+    /// span many markets).  The schema version lives in the instance
+    /// record rather than in the topic tuple.
     pub fn emit_bet_batch_created(
         env: &Env,
         bettor: &Address,
@@ -404,10 +530,7 @@ impl BettingEventEmitter {
             nonce,
             timestamp: ts,
         };
-        env.events().publish(
-            (TOPIC_BET_BATCH_CREATED, bettor.clone(), BETTING_EVENT_SCHEMA_VERSION),
-            event,
-        );
+        env.events().publish((TOPIC_BET_BATCH_CREATED, bettor.clone()), event);
     }
 
     /// Emit a [`BetStatusChangedEvent`] for any non-creation lifecycle
@@ -434,10 +557,7 @@ impl BettingEventEmitter {
             nonce,
             timestamp: ts,
         };
-        env.events().publish(
-            (TOPIC_BET_STATUS_CHANGED, market_id.clone(), BETTING_EVENT_SCHEMA_VERSION),
-            event,
-        );
+        env.events().publish((TOPIC_BET_STATUS_CHANGED, market_id.clone()), event);
     }
 
     /// Emit a [`BetClaimedEvent`] for a successful payout.
@@ -465,10 +585,7 @@ impl BettingEventEmitter {
             nonce,
             timestamp: ts,
         };
-        env.events().publish(
-            (TOPIC_BET_CLAIMED, user.clone(), BETTING_EVENT_SCHEMA_VERSION),
-            event,
-        );
+        env.events().publish((TOPIC_BET_CLAIMED, user.clone()), event);
     }
 
     /// Emit a [`BetStatsUpdatedEvent`] for aggregate-stats changes.
@@ -488,9 +605,6 @@ impl BettingEventEmitter {
             nonce,
             timestamp: ts,
         };
-        env.events().publish(
-            (TOPIC_BET_STATS_UPDATED, market_id.clone(), BETTING_EVENT_SCHEMA_VERSION),
-            event,
-        );
+        env.events().publish((TOPIC_BET_STATS_UPDATED, market_id.clone()), event);
     }
 }

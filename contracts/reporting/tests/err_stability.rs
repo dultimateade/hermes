@@ -10,17 +10,35 @@
 
 use reporting::ReportingError;
 
+fn expected_discriminant(error: ReportingError) -> u32 {
+    match error {
+        ReportingError::Unauthorized => 1,
+        ReportingError::NotInitialized => 2,
+        ReportingError::AlreadyInitialized => 3,
+        ReportingError::ReportingPaused => 4,
+        ReportingError::InvalidAdmin => 5,
+        ReportingError::InvalidReporter => 6,
+        ReportingError::ReportNotFound => 7,
+        ReportingError::DisputeNotFound => 8,
+        ReportingError::InvalidNewOwner => 9,
+    }
+}
+
 #[test]
 fn test_error_variant_stability() {
-    assert_eq!(ReportingError::Unauthorized as u32, 1);
-    assert_eq!(ReportingError::NotInitialized as u32, 2);
-    assert_eq!(ReportingError::AlreadyInitialized as u32, 3);
-    assert_eq!(ReportingError::ReportingPaused as u32, 4);
-    assert_eq!(ReportingError::InvalidAdmin as u32, 5);
-    assert_eq!(ReportingError::InvalidReporter as u32, 6);
-    assert_eq!(ReportingError::ReportNotFound as u32, 7);
-    assert_eq!(ReportingError::DisputeNotFound as u32, 8);
-    assert_eq!(ReportingError::InvalidNewOwner as u32, 9);
+    for error in [
+        ReportingError::Unauthorized,
+        ReportingError::NotInitialized,
+        ReportingError::AlreadyInitialized,
+        ReportingError::ReportingPaused,
+        ReportingError::InvalidAdmin,
+        ReportingError::InvalidReporter,
+        ReportingError::ReportNotFound,
+        ReportingError::DisputeNotFound,
+        ReportingError::InvalidNewOwner,
+    ] {
+        assert_eq!(error as u32, expected_discriminant(error));
+    }
 }
 
 #[test]

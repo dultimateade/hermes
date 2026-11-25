@@ -144,7 +144,7 @@ impl LeaderboardHeap {
 
 /// Ranking key for the winnings heap: higher `total_winnings` → higher rank.
 #[inline]
-fn key_winnings(e: &UserLeaderboardEntryV1) -> i128 {
+pub fn key_winnings(e: &UserLeaderboardEntryV1) -> i128 {
     e.total_winnings
 }
 
@@ -154,7 +154,7 @@ fn key_winnings(e: &UserLeaderboardEntryV1) -> i128 {
 /// that win-rate is primary and volume is secondary, both fitting in one i128
 /// comparison.
 #[inline]
-fn key_win_rate(e: &UserLeaderboardEntryV1) -> i128 {
+pub fn key_win_rate(e: &UserLeaderboardEntryV1) -> i128 {
     let rate = e.win_rate as i128;
     let bets = (e.total_bets_placed as i128).min((1i128 << 40) - 1);
     (rate << 40) | bets

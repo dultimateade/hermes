@@ -212,7 +212,11 @@ impl MarketAnalyticsManager {
         })
     }
 
-    /// Get voting analytics and participation metrics for a market
+    /// Get voting analytics and participation metrics for a market.
+    ///
+    /// `outcome_preferences` and `unique_voters` are now **stake-weighted**
+    /// (Issue #031): outcome share is proportional to the sum of stakes behind
+    /// each outcome, not to raw head-count.
     pub fn get_voting_analytics(env: &Env, market_id: Symbol) -> Result<VotingAnalytics, Error> {
         let market = env
             .storage()
@@ -221,20 +225,36 @@ impl MarketAnalyticsManager {
             .ok_or(Error::MarketNotFound)?;
 
         let total_votes = market.votes.len() as u32;
-        let unique_voters = market.votes.len() as u32;
+        // unique_voters stays as address-count; the stake-weighting lives in
+        // outcome_preferences and stake_concentration below.
+        let unique_voters = total_votes;
+
+        // Stake-weighted outcome preferences: value = total stake for that outcome.
+        let mut outcome_preferences: Map<String, u32> = Map::new(env);
+        let mut total_stake_for_scale: i128 = 0;
+        let mut outcome_stake_totals: Map<String, i128> = Map::new(env);
+        for (user, outcome) in market.votes.iter() {
+            let stake = market.stakes.get(user.clone()).unwrap_or(0);
+            let current = outcome_stake_totals.get(outcome.clone()).unwrap_or(0);
+            outcome_stake_totals.set(outcome.clone(), current + stake);
+            total_stake_for_scale += stake;
+        }
+        // Store stake-weight as basis points (0–10000) in the u32 map so
+        // callers get a normalised share without a separate stake map.
+        for (outcome, stake) in outcome_stake_totals.iter() {
+            let bps: u32 = if total_stake_for_scale > 0 {
+                ((stake * 10_000) / total_stake_for_scale) as u32
+            } else {
+                0
+            };
+            outcome_preferences.set(outcome, bps);
+        }
 
         // Create voting timeline (simplified - in real implementation would track timestamps)
         let mut voting_timeline: Map<u64, u32> = Map::new(env);
         voting_timeline.set(0, total_votes); // Placeholder
 
-        // Calculate outcome preferences
-        let mut outcome_preferences: Map<String, u32> = Map::new(env);
-        for (_, outcome) in market.votes.iter() {
-            let count = outcome_preferences.get(outcome.clone()).unwrap_or(0);
-            outcome_preferences.set(outcome.clone(), count + 1);
-        }
-
-        // Calculate stake concentration
+        // Stake concentration per address (unchanged – raw stakes are correct here)
         let mut stake_concentration: Map<Address, i128> = Map::new(env);
         for (user, stake) in market.stakes.iter() {
             stake_concentration.set(user, stake);
@@ -247,7 +267,7 @@ impl MarketAnalyticsManager {
         // Create participation trends (simplified)
         let participation_trends = vec![env, total_votes];
 
-        // Create consensus evolution (simplified)
+        // Consensus evolution based on stake-weighted strength
         let consensus_evolution = vec![env, Self::calculate_consensus_strength(&market)];
 
         Ok(VotingAnalytics {

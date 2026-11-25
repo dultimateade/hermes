@@ -73,10 +73,41 @@ pub struct BetStatusUpdatedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a bettor cancels a still-open bet inside the configured
+/// cancellation window (topic catalog: `bet_cancelled`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BetCancelledEvent {
+    pub market_id: Symbol,
+    pub bettor: Address,
+    pub amount: i128,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+/// Emitted when the admin updates the global bet-cancellation window.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BetCancelWindowSetEvent {
+    pub admin: Address,
+    pub window_seconds: u64,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaxBetCapSetEvent {
     pub cap: i128,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MaxOutcomesPerMarketSetEvent {
+    pub admin: Address,
+    pub max_outcomes: u32,
     pub nonce: u64,
     pub timestamp: u64,
 }
@@ -486,6 +517,24 @@ pub struct AdminInitializedEvent {
 pub struct AdminTransferredEvent {
     pub previous_admin: Address,
     pub new_admin: Address,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferStartedEvent {
+    pub current_admin: Address,
+    pub pending_admin: Address,
+    pub nonce: u64,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCanceledEvent {
+    pub current_admin: Address,
+    pub pending_admin: Address,
     pub nonce: u64,
     pub timestamp: u64,
 }
@@ -1026,6 +1075,14 @@ impl EventSchemaRegistry {
                 topic: symbol_short!("bet_plc"),
                 schema_version: 1,
             }),
+            "bet_cancelled" => Some(EventSchemaEntry {
+                topic: symbol_short!("bet_cncl"),
+                schema_version: 1,
+            }),
+            "bet_cancel_window_set" => Some(EventSchemaEntry {
+                topic: symbol_short!("cncl_win"),
+                schema_version: 1,
+            }),
             "market_description_updated" => Some(EventSchemaEntry {
                 topic: symbol_short!("mkt_dsc"),
                 schema_version: 1,
@@ -1149,6 +1206,36 @@ impl EventEmitter {
         env.events().publish((symbol_short!("bet_upd"), market_id.clone()), event);
     }
 
+    /// Emit a dedicated bet-cancellation event.
+    ///
+    /// Topic: `bet_cancelled` (short symbol `bet_cncl`). Distinct from
+    /// [`Self::emit_bet_status_updated`] so indexers can react to a
+    /// user-initiated cancellation (inside the configured window) without
+    /// inspecting the status strings.
+    pub fn emit_bet_cancelled(env: &Env, market_id: &Symbol, bettor: &Address, amount: i128) {
+        let event = BetCancelledEvent {
+            market_id: market_id.clone(), bettor: bettor.clone(), amount,
+            nonce: Self::get_and_increment_nonce(env, symbol_short!("bet_cncl")),
+            timestamp: env.ledger().timestamp(),
+        };
+        Self::store_event(env, &symbol_short!("bet_cncl"), &event);
+        env.events().publish((symbol_short!("bet_cncl"), market_id.clone()), event);
+    }
+
+    /// Emit the new global bet-cancellation window.
+    ///
+    /// Topic: `bet_cancel_window_set` (short symbol `cncl_win`). Lets
+    /// indexers and front-ends track the configured window.
+    pub fn emit_bet_cancel_window_set(env: &Env, admin: &Address, window_seconds: u64) {
+        let event = BetCancelWindowSetEvent {
+            admin: admin.clone(), window_seconds,
+            nonce: Self::get_and_increment_nonce(env, symbol_short!("cncl_win")),
+            timestamp: env.ledger().timestamp(),
+        };
+        Self::store_event(env, &symbol_short!("cncl_win"), &event);
+        env.events().publish((symbol_short!("cncl_win"),), event);
+    }
+
     pub fn emit_max_bet_cap_set(env: &Env, cap: i128) {
         let event_sym = symbol_short!("mbt_cap");
         let event = MaxBetCapSetEvent {
@@ -1158,6 +1245,19 @@ impl EventEmitter {
         };
         Self::store_event(env, &event_sym, &event);
         env.events().publish((event_sym,), event);
+    }
+
+    pub fn emit_max_outcomes_per_market_set(env: &Env, admin: &Address, max_outcomes: u32) {
+        let event_sym = symbol_short!("mxoutc");
+        let event = MaxOutcomesPerMarketSetEvent {
+            admin: admin.clone(),
+            max_outcomes,
+            nonce: Self::get_and_increment_nonce(env, event_sym.clone()),
+            timestamp: env.ledger().timestamp(),
+        };
+        // `store_event` both persists the payload and publishes it under
+        // `event_sym`, so no extra `publish` here.
+        Self::store_event(env, &event_sym, &event);
     }
 
     pub fn emit_oracle_result(
@@ -1408,6 +1508,28 @@ impl EventEmitter {
         };
         Self::store_event(env, &symbol_short!("adm_xfer"), &event);
         env.events().publish((symbol_short!("adm_xfer"), new_admin.clone()), event);
+    }
+
+    pub fn emit_admin_transfer_started(env: &Env, current_admin: &Address, pending_admin: &Address) {
+        let event = AdminTransferStartedEvent {
+            current_admin: current_admin.clone(),
+            pending_admin: pending_admin.clone(),
+            nonce: Self::get_and_increment_nonce(env, symbol_short!("adm_xf_st")),
+            timestamp: env.ledger().timestamp(),
+        };
+        Self::store_event(env, &symbol_short!("adm_xf_st"), &event);
+        env.events().publish((symbol_short!("adm_xf_st"), pending_admin.clone()), event);
+    }
+
+    pub fn emit_admin_transfer_canceled(env: &Env, current_admin: &Address, pending_admin: &Address) {
+        let event = AdminTransferCanceledEvent {
+            current_admin: current_admin.clone(),
+            pending_admin: pending_admin.clone(),
+            nonce: Self::get_and_increment_nonce(env, symbol_short!("adm_xf_cn")),
+            timestamp: env.ledger().timestamp(),
+        };
+        Self::store_event(env, &symbol_short!("adm_xf_cn"), &event);
+        env.events().publish((symbol_short!("adm_xf_cn"), pending_admin.clone()), event);
     }
 
     pub fn emit_admin_role_assigned(env: &Env, admin: &Address, role: &AdminRole, assigned_by: &Address) {

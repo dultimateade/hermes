@@ -29,6 +29,7 @@ pub fn get_event_topic_catalog(env: &Env) -> Vec<EventTopicEntry> {
         ("place_bets",                 "bet_batch_placed",           "Fired when multiple bets are placed in a single batch"),
         ("resolve_market_bets",        "bet_status_updated",         "Fired when a bet's status changes (won/lost/refunded/cancelled)"),
         ("set_global_bet_limits",      "bet_limits_updated",         "Fired when global or per-event bet limits are updated"),
+        ("set_max_outcomes_per_market", "max_outcomes_per_market_set", "Fired when the admin changes the maximum outcomes a new market may declare"),
         ("update_market_bet_stats",    "bet_stats_updated",          "Fired when per-market betting statistics are updated"),
         ("resolve_market",             "market_resolved",            "Fired on successful market resolution"),
         ("resolve_market_manual",      "market_resolved_manual",     "Fired on admin manual resolution"),

@@ -10,4 +10,4 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 oracles = { path = ".." }
-soroban-sdk = { version = "25.0.0", features = ["testutils"] }
+soroban-sdk = { workspace = true, features = ["testutils"] }

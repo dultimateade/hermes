@@ -15,7 +15,7 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
     Address, Env,
 };
-use validators::{ValidatorsContract, ValidatorsContractClient};
+use validators::{ValidatorError, ValidatorsContract, ValidatorsContractClient};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -154,6 +154,61 @@ fn test_deregister_validator_requires_auth_success() {
     }
 }
 
+#[test]
+fn test_deregister_validator_rejected_during_active_round() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+
+    let result = ts.client.try_deregister_validator(&ts.validator);
+    assert!(
+        result.is_err(),
+        "validator must not deregister during an active resolution round"
+    );
+    assert!(
+        ts.client.is_validator(&ts.validator),
+        "validator registration must remain intact"
+    );
+}
+
+#[test]
+fn test_ending_resolution_round_allows_deregistration() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+    ts.client.end_resolution_round(&ts.admin, &ts.validator);
+
+    let result = ts.client.try_deregister_validator(&ts.validator);
+    assert!(
+        result.is_ok(),
+        "validator must be able to deregister after the round concludes"
+    );
+}
+
+#[test]
+fn test_resolution_round_lifecycle_requires_admin_auth() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    let start_result = ts
+        .client
+        .try_start_resolution_round(&ts.unauthorized, &ts.validator);
+    assert!(start_result.is_err(), "only admin may start a resolution round");
+
+    ts.client
+        .start_resolution_round(&ts.admin, &ts.validator);
+    let end_result = ts
+        .client
+        .try_end_resolution_round(&ts.unauthorized, &ts.validator);
+    assert!(end_result.is_err(), "only admin may end a resolution round");
+
+    assert!(ts.client.is_validator_in_active_round(&ts.validator));
+}
+
 // ===========================================================================
 // update_stake
 // ===========================================================================
@@ -181,6 +236,33 @@ fn test_update_stake_requires_auth_success() {
             assert!(!s.to_lowercase().contains("auth"), "update_stake auth must pass; got: {s}");
         }
     }
+}
+
+#[test]
+fn test_update_stake_enforces_inclusive_min_and_max_bounds() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &MIN_STAKE),
+        Ok(Ok(())),
+        "stake exactly at min_stake should succeed"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &(MIN_STAKE - 1)),
+        Ok(Err(ValidatorError::StakeTooLow)),
+        "stake below min_stake should fail"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &MAX_STAKE),
+        Ok(Ok(())),
+        "stake exactly at max_stake should succeed"
+    );
+    assert_eq!(
+        ts.client.try_update_stake(&ts.validator, &(MAX_STAKE + 1)),
+        Ok(Err(ValidatorError::StakeTooHigh)),
+        "stake above max_stake should fail"
+    );
 }
 
 // ===========================================================================
@@ -387,6 +469,10 @@ fn test_view_entrypoints_do_not_require_auth() {
     let exists = ts.client.is_validator(&ts.validator);
     assert!(exists, "ts.validator should be registered");
 
+    // is_validator_in_active_round
+    let in_active_round = ts.client.is_validator_in_active_round(&ts.validator);
+    assert!(!in_active_round, "validator should not be in an active round");
+
     // get_validator
     let info_opt = ts.client.get_validator(&ts.validator);
     assert!(info_opt.is_some(), "get_validator should return Some");
@@ -412,6 +498,35 @@ fn test_double_register_fails() {
 
     let result = ts.client.try_register_validator(&ts.validator, &INIT_STAKE);
     assert!(result.is_err(), "duplicate registration must fail");
+}
+
+#[test]
+fn test_list_validators_preserves_order_and_paginates() {
+    let env = Env::default();
+    let ts = setup_with_validator(&env);
+    let second = Address::generate(&env);
+    let third = Address::generate(&env);
+
+    ts.client.register_validator(&second, &INIT_STAKE);
+    ts.client.register_validator(&third, &INIT_STAKE);
+
+    let first_page = ts.client.list_validators(&0, &2);
+    assert_eq!(first_page.len(), 2);
+    assert_eq!(first_page.get(0).unwrap(), ts.validator);
+    assert_eq!(first_page.get(1).unwrap(), second);
+
+    let second_page = ts.client.list_validators(&1, &2);
+    assert_eq!(second_page.len(), 2);
+    assert_eq!(second_page.get(0).unwrap(), second);
+    assert_eq!(second_page.get(1).unwrap(), third);
+    assert_eq!(ts.client.list_validators(&3, &2).len(), 0);
+    assert_eq!(ts.client.list_validators(&0, &0).len(), 0);
+
+    ts.client.deregister_validator(&second);
+    let remaining = ts.client.list_validators(&0, &3);
+    assert_eq!(remaining.len(), 2);
+    assert_eq!(remaining.get(0).unwrap(), ts.validator);
+    assert_eq!(remaining.get(1).unwrap(), third);
 }
 
 /// Deregistering an unknown address should return ValidatorNotFound.

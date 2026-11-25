@@ -1,0 +1,42 @@
+{
+  "contract": "analytics",
+  "default_max_regression_pct": 20.0,
+  "thresholds": {
+    "record_event": {
+      "max_time_ns": 1000,
+      "max_regression_pct": 20.0,
+      "unit": "ns",
+      "description": "Legacy microbenchmark for record_event arithmetic"
+    },
+    "aggregate_1000": {
+      "max_time_ns": 10000,
+      "max_regression_pct": 20.0,
+      "unit": "ns",
+      "description": "Microbenchmark for 1000 integer aggregation"
+    },
+    "percentile_p95_1000": {
+      "max_time_ns": 100000,
+      "max_regression_pct": 20.0,
+      "unit": "ns",
+      "description": "Microbenchmark for P95 percentile calculation over 1000 values"
+    },
+    "contract_record_metric": {
+      "max_time_ns": 1500000,
+      "max_regression_pct": 25.0,
+      "unit": "ns",
+      "description": "Soroban contract record metric storage operation"
+    },
+    "contract_get_time_series_200_pts": {
+      "max_time_ns": 5000000,
+      "max_regression_pct": 25.0,
+      "unit": "ns",
+      "description": "Soroban contract time-series bucket query over 200 data points"
+    },
+    "contract_get_metric_summary": {
+      "max_time_ns": 500000,
+      "max_regression_pct": 25.0,
+      "unit": "ns",
+      "description": "Soroban contract metric summary query"
+    }
+  }
+}

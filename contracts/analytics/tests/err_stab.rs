@@ -87,9 +87,10 @@ error_code_snapshot! {
     ValueOutOfRange = 23,
 
     // -- configuration / admin (30-39) --
-    InvalidConfig    = 30,
-    AnalyticsPaused  = 31,
-    InvalidState     = 32,
+    InvalidConfig        = 30,
+    AnalyticsPaused      = 31,
+    InvalidState         = 32,
+    ThresholdBelowMinimum = 33,
 }
 
 // ---------------------------------------------------------------------------
@@ -105,7 +106,7 @@ error_code_snapshot! {
 fn analytics_error_codes_are_stable() {
     assert_eq!(
         ERROR_CODE_SNAPSHOT.len(),
-        15,
+        16,
         "snapshot length changed — update this count when adding or removing variants"
     );
 

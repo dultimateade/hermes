@@ -5,10 +5,18 @@
 //!
 //! Each test exercises one public resolution entrypoint, captures the
 //! mock-host budget delta (CPU instructions + memory bytes), and asserts
-//! that the delta stays within a named baseline + 5% ceiling.  The
-//! baselines are the checked-in reference values: a PR that causes any
-//! delta to exceed `baseline + ceil(baseline / 20)` must justify the
-//! increase or tighten the constant.
+//! that the delta stays within the threshold + 5% ceiling defined in
+//! `contracts/resolution/benches/thresholds.json`.  Thresholds are stored
+//! in JSON rather than as inline constants so that they can be updated in one
+//! place without touching test code, consistent with how the markets and
+//! analytics contracts manage their benchmark thresholds.
+//!
+//! # Updating thresholds
+//!
+//! When an intentional change raises costs beyond the 5% ceiling, update the
+//! relevant entry in `benches/thresholds.json` and document the reason in
+//! the commit message.  Do **not** renumber existing discriminants; only
+//! raise the `max_cpu_insns` / `max_mem_bytes` values.
 //!
 //! # Methodology
 //!
@@ -16,9 +24,9 @@
 //!    `env.cost_estimate().budget().reset_unlimited()` so that setup cost
 //!    is excluded from the measured delta.
 //! 2. After the call under test, the cumulative counters are read and
-//!    compared against the baseline.
-//! 3. Thresholds use *exact baselines with a 5% ceiling*, not arbitrary
-//!    round numbers, so any meaningful code-path change is caught.
+//!    compared against the threshold.
+//! 3. Thresholds use a 5% ceiling, not arbitrary round numbers, so any
+//!    meaningful code-path change is caught.
 //!
 //! # Entrypoint coverage
 //!
@@ -29,12 +37,6 @@
 //! | 3 | `force_resolve_market`     | admin    | `Result<(), E>`  |
 //! | 4 | `resolve_market`           | caller   | `Result<(), E>`  |
 //! | 5 | `resolve_dispute`          | admin    | `Result<DR, E>`  |
-//!
-//! # CI enforcement
-//!
-//! The `five_percent_ceiling` helper implements the 5% regression guard.
-//! A compile-time unit test (`regression_margin_is_exactly_five_percent`)
-//! verifies the arithmetic for edge cases.
 
 use predictify_hybrid::{PredictifyHybrid, PredictifyHybridClient};
 use predictify_hybrid::types::{OracleConfig, OracleProvider};
@@ -42,53 +44,47 @@ use soroban_sdk::{
     testutils::{Address as _, Ledger},
     Address, Env, String, Symbol, Vec,
 };
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
-// Baseline constants
+// Threshold loading
 // ---------------------------------------------------------------------------
-//
-// These values were measured with soroban-sdk 25.x on the mock host with an
-// unlimited budget reset immediately before each call.  They represent the
-// "cheapest measurable path" for each entrypoint:
-//
-//   resolve_market_manual      → panics with MarketNotFound (one storage read)
-//   resolve_market_with_ties   → panics with MarketNotFound (one storage read)
-//   force_resolve_market       → Err(MarketNotFound)        (one storage read)
-//   resolve_market             → Err(MarketNotFound) via stats/analytics path
-//   resolve_dispute            → Err(MarketNotFound)        (one storage read)
-//
-// All setup (register, initialize, generate addresses) is done *before* the
-// budget reset so only the entrypoint itself is measured.
-//
-// Thresholds are set at 3× the measured mock-host delta to allow headroom
-// for SDK patch upgrades while still catching regressions.  Tighten them
-// once `stellar contract invoke --cost` p99 values from production are
-// available.
 
-/// Baseline CPU instructions for `resolve_market_manual` (fast-exit path).
-const RESOLVE_MARKET_MANUAL_CPU: u64 = 500_000;
-/// Baseline memory bytes for `resolve_market_manual` (fast-exit path).
-const RESOLVE_MARKET_MANUAL_MEM: u64 = 150_000;
+/// One entry from `benches/thresholds.json`.
+struct Threshold {
+    max_cpu_insns: u64,
+    max_mem_bytes: u64,
+}
 
-/// Baseline CPU instructions for `resolve_market_with_ties` (fast-exit path).
-const RESOLVE_MARKET_WITH_TIES_CPU: u64 = 500_000;
-/// Baseline memory bytes for `resolve_market_with_ties` (fast-exit path).
-const RESOLVE_MARKET_WITH_TIES_MEM: u64 = 150_000;
+/// Load the thresholds map from `benches/thresholds.json`.
+///
+/// The JSON is embedded into the test binary at compile time via `include_str!`,
+/// so the file must exist when `cargo test` is compiled.  This mirrors the
+/// source-of-truth role of `thresholds.json` in the markets and analytics
+/// contracts (where the same file is consumed by the CI benchmark script).
+fn load_thresholds() -> HashMap<std::string::String, Threshold> {
+    const RAW: &str = include_str!("../benches/thresholds.json");
 
-/// Baseline CPU instructions for `force_resolve_market` (fast-exit path).
-const FORCE_RESOLVE_MARKET_CPU: u64 = 500_000;
-/// Baseline memory bytes for `force_resolve_market` (fast-exit path).
-const FORCE_RESOLVE_MARKET_MEM: u64 = 150_000;
+    let doc: serde_json::Value = serde_json::from_str(RAW)
+        .expect("benches/thresholds.json must be valid JSON");
 
-/// Baseline CPU instructions for `resolve_market` (legacy oracle path).
-const RESOLVE_MARKET_CPU: u64 = 500_000;
-/// Baseline memory bytes for `resolve_market` (legacy oracle path).
-const RESOLVE_MARKET_MEM: u64 = 150_000;
+    let entries = doc["thresholds"]
+        .as_object()
+        .expect("thresholds.json must have a 'thresholds' object");
 
-/// Baseline CPU instructions for `resolve_dispute` (fast-exit path).
-const RESOLVE_DISPUTE_CPU: u64 = 500_000;
-/// Baseline memory bytes for `resolve_dispute` (fast-exit path).
-const RESOLVE_DISPUTE_MEM: u64 = 150_000;
+    entries
+        .iter()
+        .map(|(k, v)| {
+            let cpu = v["max_cpu_insns"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("threshold '{k}' missing max_cpu_insns"));
+            let mem = v["max_mem_bytes"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("threshold '{k}' missing max_mem_bytes"));
+            (k.clone(), Threshold { max_cpu_insns: cpu, max_mem_bytes: mem })
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Budget helpers
@@ -129,17 +125,19 @@ fn five_percent_ceiling(baseline: u64) -> u64 {
 /// Prints a structured diagnostic line so CI logs are immediately actionable
 /// even when `--nocapture` is not passed (the assert message carries all
 /// numbers).
-fn assert_budget(label: &str, cpu: u64, mem: u64, cpu_max: u64, mem_max: u64) {
+fn assert_budget(label: &str, cpu: u64, mem: u64, threshold: &Threshold) {
+    let cpu_max = threshold.max_cpu_insns;
+    let mem_max = threshold.max_mem_bytes;
     let cpu_limit = five_percent_ceiling(cpu_max);
     let mem_limit = five_percent_ceiling(mem_max);
 
     assert!(
         cpu <= cpu_limit,
-        "{label}: CPU regression >{cpu_max}+5%: measured={cpu}, baseline={cpu_max}, limit={cpu_limit}"
+        "{label}: CPU regression >{cpu_max}+5%: measured={cpu}, threshold={cpu_max}, limit={cpu_limit}"
     );
     assert!(
         mem <= mem_limit,
-        "{label}: mem regression >{mem_max}+5%: measured={mem}, baseline={mem_max}, limit={mem_limit}"
+        "{label}: mem regression >{mem_max}+5%: measured={mem}, threshold={mem_max}, limit={mem_limit}"
     );
 }
 
@@ -233,6 +231,9 @@ impl Fixture {
 /// The call is expected to succeed (market ends → winning outcome stored).
 #[test]
 fn snap_resolve_market_manual() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market_manual").expect("threshold 'resolve_market_manual' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     f.advance_past_end();
@@ -248,13 +249,7 @@ fn snap_resolve_market_manual() {
     );
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market_manual",
-        cpu,
-        mem,
-        RESOLVE_MARKET_MANUAL_CPU,
-        RESOLVE_MARKET_MANUAL_MEM,
-    );
+    assert_budget("resolve_market_manual", cpu, mem, t);
 }
 
 /// Snapshot: `resolve_market_manual` before market end — hits `MarketNotEnded`
@@ -263,6 +258,9 @@ fn snap_resolve_market_manual() {
 /// Confirms the early-exit path is not more expensive than the full resolution.
 #[test]
 fn snap_resolve_market_manual_not_ended() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market_manual").expect("threshold 'resolve_market_manual' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     // Do NOT advance time — market is still active.
@@ -277,13 +275,7 @@ fn snap_resolve_market_manual_not_ended() {
     );
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market_manual/not_ended",
-        cpu,
-        mem,
-        RESOLVE_MARKET_MANUAL_CPU,
-        RESOLVE_MARKET_MANUAL_MEM,
-    );
+    assert_budget("resolve_market_manual/not_ended", cpu, mem, t);
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +287,9 @@ fn snap_resolve_market_manual_not_ended() {
 /// Two-element `winning_outcomes` Vec → one validation pass + state writes.
 #[test]
 fn snap_resolve_market_with_ties() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market_with_ties").expect("threshold 'resolve_market_with_ties' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     f.advance_past_end();
@@ -311,13 +306,7 @@ fn snap_resolve_market_with_ties() {
         .try_resolve_market_with_ties(&f.admin, &market_id, &winning);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market_with_ties",
-        cpu,
-        mem,
-        RESOLVE_MARKET_WITH_TIES_CPU,
-        RESOLVE_MARKET_WITH_TIES_MEM,
-    );
+    assert_budget("resolve_market_with_ties", cpu, mem, t);
 }
 
 /// Snapshot: `resolve_market_with_ties` with a single-element outcome Vec.
@@ -326,6 +315,9 @@ fn snap_resolve_market_with_ties() {
 /// is within the same budget envelope as the two-element path.
 #[test]
 fn snap_resolve_market_with_ties_single_outcome() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market_with_ties").expect("threshold 'resolve_market_with_ties' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     f.advance_past_end();
@@ -341,13 +333,7 @@ fn snap_resolve_market_with_ties_single_outcome() {
         .try_resolve_market_with_ties(&f.admin, &market_id, &winning);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market_with_ties/single_outcome",
-        cpu,
-        mem,
-        RESOLVE_MARKET_WITH_TIES_CPU,
-        RESOLVE_MARKET_WITH_TIES_MEM,
-    );
+    assert_budget("resolve_market_with_ties/single_outcome", cpu, mem, t);
 }
 
 // ---------------------------------------------------------------------------
@@ -361,6 +347,9 @@ fn snap_resolve_market_with_ties_single_outcome() {
 /// can use `try_force_resolve_market`.
 #[test]
 fn snap_force_resolve_market() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("force_resolve_market").expect("threshold 'force_resolve_market' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
 
@@ -379,13 +368,7 @@ fn snap_force_resolve_market() {
     );
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "force_resolve_market",
-        cpu,
-        mem,
-        FORCE_RESOLVE_MARKET_CPU,
-        FORCE_RESOLVE_MARKET_MEM,
-    );
+    assert_budget("force_resolve_market", cpu, mem, t);
 }
 
 /// Snapshot: `force_resolve_market` with empty reason — hits the
@@ -395,6 +378,9 @@ fn snap_force_resolve_market() {
 /// This measures the cheapest guard path and must fit within the same envelope.
 #[test]
 fn snap_force_resolve_market_empty_reason() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("force_resolve_market").expect("threshold 'force_resolve_market' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
 
@@ -413,13 +399,7 @@ fn snap_force_resolve_market_empty_reason() {
     );
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "force_resolve_market/empty_reason",
-        cpu,
-        mem,
-        FORCE_RESOLVE_MARKET_CPU,
-        FORCE_RESOLVE_MARKET_MEM,
-    );
+    assert_budget("force_resolve_market/empty_reason", cpu, mem, t);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +414,9 @@ fn snap_force_resolve_market_empty_reason() {
 /// itself is bypassed in the mock environment.
 #[test]
 fn snap_resolve_market() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market").expect("threshold 'resolve_market' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
 
@@ -443,13 +426,7 @@ fn snap_resolve_market() {
     let _ = f.client().try_resolve_market(&f.admin, &market_id);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market",
-        cpu,
-        mem,
-        RESOLVE_MARKET_CPU,
-        RESOLVE_MARKET_MEM,
-    );
+    assert_budget("resolve_market", cpu, mem, t);
 }
 
 /// Snapshot: `resolve_market` called by a non-admin user (still requires
@@ -459,6 +436,9 @@ fn snap_resolve_market() {
 /// same code path.
 #[test]
 fn snap_resolve_market_non_admin_caller() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_market").expect("threshold 'resolve_market' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     let caller = Address::generate(&f.env);
@@ -469,13 +449,7 @@ fn snap_resolve_market_non_admin_caller() {
     let _ = f.client().try_resolve_market(&caller, &market_id);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_market/non_admin_caller",
-        cpu,
-        mem,
-        RESOLVE_MARKET_CPU,
-        RESOLVE_MARKET_MEM,
-    );
+    assert_budget("resolve_market/non_admin_caller", cpu, mem, t);
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +463,9 @@ fn snap_resolve_market_non_admin_caller() {
 /// keep the snapshot focused on the entrypoint entry cost.
 #[test]
 fn snap_resolve_dispute() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_dispute").expect("threshold 'resolve_dispute' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
     f.advance_past_end();
@@ -508,13 +485,7 @@ fn snap_resolve_dispute() {
     let _ = f.client().try_resolve_dispute(&f.admin, &market_id);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_dispute",
-        cpu,
-        mem,
-        RESOLVE_DISPUTE_CPU,
-        RESOLVE_DISPUTE_MEM,
-    );
+    assert_budget("resolve_dispute", cpu, mem, t);
 }
 
 /// Snapshot: `resolve_dispute` on an unresolved market — hits the guard
@@ -523,6 +494,9 @@ fn snap_resolve_dispute() {
 /// This exercises the earliest possible exit after auth + market storage read.
 #[test]
 fn snap_resolve_dispute_no_prior_resolution() {
+    let thresholds = load_thresholds();
+    let t = thresholds.get("resolve_dispute").expect("threshold 'resolve_dispute' missing from thresholds.json");
+
     let f = Fixture::new();
     let market_id = f.create_market();
 
@@ -532,70 +506,54 @@ fn snap_resolve_dispute_no_prior_resolution() {
     let _ = f.client().try_resolve_dispute(&f.admin, &market_id);
 
     let (cpu, mem) = delta(before, snap(&f.env));
-    assert_budget(
-        "resolve_dispute/no_prior_resolution",
-        cpu,
-        mem,
-        RESOLVE_DISPUTE_CPU,
-        RESOLVE_DISPUTE_MEM,
-    );
+    assert_budget("resolve_dispute/no_prior_resolution", cpu, mem, t);
 }
 
 // ---------------------------------------------------------------------------
-// Constant sanity checks
+// Threshold file integrity checks
 // ---------------------------------------------------------------------------
 
-/// Verify that all threshold constants are positive and logically ordered.
-///
-/// Ordering rule: write-heavy entrypoints (`resolve_market_manual`,
-/// `force_resolve_market`) should cost at least as much as the lighter
-/// `resolve_market` oracle path.  This catches copy-paste errors in the
-/// constant table.
+/// Verify that `thresholds.json` can be loaded and all expected keys are present.
 #[test]
-fn threshold_constants_are_sane() {
-    // All positive
-    for (name, v) in [
-        ("RESOLVE_MARKET_MANUAL_CPU",      RESOLVE_MARKET_MANUAL_CPU),
-        ("RESOLVE_MARKET_MANUAL_MEM",      RESOLVE_MARKET_MANUAL_MEM),
-        ("RESOLVE_MARKET_WITH_TIES_CPU",   RESOLVE_MARKET_WITH_TIES_CPU),
-        ("RESOLVE_MARKET_WITH_TIES_MEM",   RESOLVE_MARKET_WITH_TIES_MEM),
-        ("FORCE_RESOLVE_MARKET_CPU",       FORCE_RESOLVE_MARKET_CPU),
-        ("FORCE_RESOLVE_MARKET_MEM",       FORCE_RESOLVE_MARKET_MEM),
-        ("RESOLVE_MARKET_CPU",             RESOLVE_MARKET_CPU),
-        ("RESOLVE_MARKET_MEM",             RESOLVE_MARKET_MEM),
-        ("RESOLVE_DISPUTE_CPU",            RESOLVE_DISPUTE_CPU),
-        ("RESOLVE_DISPUTE_MEM",            RESOLVE_DISPUTE_MEM),
+fn thresholds_json_has_all_required_keys() {
+    let thresholds = load_thresholds();
+    for key in &[
+        "resolve_market_manual",
+        "resolve_market_with_ties",
+        "force_resolve_market",
+        "resolve_market",
+        "resolve_dispute",
     ] {
-        assert!(v > 0, "{name} must be > 0");
+        assert!(
+            thresholds.contains_key(*key),
+            "thresholds.json is missing required key '{key}'"
+        );
     }
+}
 
-    // Manual / force-resolve paths do at least as much work as the
-    // legacy oracle path.
-    assert!(
-        RESOLVE_MARKET_MANUAL_CPU >= RESOLVE_MARKET_CPU,
-        "manual >= oracle (CPU)"
-    );
-    assert!(
-        RESOLVE_MARKET_MANUAL_MEM >= RESOLVE_MARKET_MEM,
-        "manual >= oracle (mem)"
-    );
-    assert!(
-        FORCE_RESOLVE_MARKET_CPU >= RESOLVE_MARKET_CPU,
-        "force >= oracle (CPU)"
-    );
-    assert!(
-        FORCE_RESOLVE_MARKET_MEM >= RESOLVE_MARKET_MEM,
-        "force >= oracle (mem)"
-    );
+/// Verify that every threshold entry has positive, non-zero values.
+#[test]
+fn thresholds_json_values_are_positive() {
+    let thresholds = load_thresholds();
+    for (key, t) in &thresholds {
+        assert!(
+            t.max_cpu_insns > 0,
+            "threshold '{key}': max_cpu_insns must be > 0"
+        );
+        assert!(
+            t.max_mem_bytes > 0,
+            "threshold '{key}': max_mem_bytes must be > 0"
+        );
+    }
 }
 
 /// Verify the 5% ceiling arithmetic for edge-case inputs.
 #[test]
 fn regression_margin_is_exactly_five_percent_rounded_up() {
     assert_eq!(five_percent_ceiling(0), 0);
-    assert_eq!(five_percent_ceiling(1), 2);   // 1 + ceil(1/20)=1 → 2
-    assert_eq!(five_percent_ceiling(20), 21);  // 20 + ceil(20/20)=1 → 21
-    assert_eq!(five_percent_ceiling(21), 23);  // 21 + ceil(21/20)=2 → 23
+    assert_eq!(five_percent_ceiling(1), 2);    // 1 + ceil(1/20)=1 → 2
+    assert_eq!(five_percent_ceiling(20), 21);   // 20 + ceil(20/20)=1 → 21
+    assert_eq!(five_percent_ceiling(21), 23);   // 21 + ceil(21/20)=2 → 23
     assert_eq!(five_percent_ceiling(100), 105); // 100 + 5 → 105
     assert_eq!(five_percent_ceiling(200), 210); // 200 + 10 → 210
 }

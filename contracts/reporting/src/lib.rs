@@ -31,17 +31,15 @@
 
 #![no_std]
 
-extern crate std;
-
 mod err;
 mod events;
 mod pause;
 mod types;
 
 pub use err::ReportingError;
-pub use types::DataKey;
+pub use types::{DataKey, Report};
 
-use soroban_sdk::{contract, contractimpl, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, Address, Env, String, Vec};
 
 /// The Reporting contract.
 #[contract]
@@ -79,13 +77,9 @@ impl ReportingContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Initialized, &true);
 
-        // Initialise ID counters; first issued ID will be 1.
         env.storage()
             .persistent()
             .set(&DataKey::NextReportId, &1u32);
-        env.storage()
-            .persistent()
-            .set(&DataKey::NextDisputeId, &1u32);
 
         Ok(())
     }
@@ -104,6 +98,10 @@ impl ReportingContract {
     /// * `report_hash`  — On-chain commitment hash of the off-chain report
     ///                    document (e.g. SHA-256 hex string).
     ///
+    /// # Returns
+    ///
+    /// The numeric ID of the newly created report.
+    ///
     /// # Errors
     ///
     /// * [`ReportingError::ReportingPaused`] — Reporting is currently paused;
@@ -118,22 +116,52 @@ impl ReportingContract {
         market_id: u32,
         report_data: String,
         report_hash: String,
-    ) -> Result<(), ReportingError> {
-        reporter.require_auth();
-        // Guard: halt state changes when paused.
+    ) -> Result<u32, ReportingError> {
         pause::require_not_paused(&env)?;
-        let _ = (market_id, report_data, report_hash);
-        Ok(())
+        reporter.require_auth();
+
+        let report_id: u32 = env
+            .storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::NextReportId)
+            .unwrap_or(1);
+
+        let next_id = report_id.checked_add(1).expect("report ID overflow");
+
+        let report = Report {
+            id: report_id,
+            market_id,
+            reporter: reporter.clone(),
+            report_data,
+            report_hash,
+            status: 0,
+            created_at: env.ledger().sequence(),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Report(report_id), &report);
+
+        let mut market_reports: Vec<u32> = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::MarketReports(market_id))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        market_reports.push_back(report_id);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::MarketReports(market_id), &market_reports);
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::NextReportId, &next_id);
+
+        Ok(report_id)
     }
 
     /// Verify a previously submitted report.
-    ///
-    /// # Parameters
-    ///
-    /// * `admin`               — Current admin address. Must sign the call.
-    /// * `report_id`           — Identifier of the report to verify.
-    /// * `verification_result` — `true` if the report passes verification,
-    ///                           `false` otherwise.
     ///
     /// # Errors
     ///
@@ -148,19 +176,13 @@ impl ReportingContract {
         report_id: u32,
         verification_result: bool,
     ) -> Result<(), ReportingError> {
-        admin.require_auth();
         pause::require_not_paused(&env)?;
+        admin.require_auth();
         let _ = (report_id, verification_result);
         Ok(())
     }
 
     /// Dispute a report, initiating the dispute-resolution workflow.
-    ///
-    /// # Parameters
-    ///
-    /// * `reporter`       — Address of the disputing party. Must sign the call.
-    /// * `report_id`      — Identifier of the report being disputed.
-    /// * `dispute_reason` — Human-readable rationale for the dispute.
     ///
     /// # Errors
     ///
@@ -175,20 +197,13 @@ impl ReportingContract {
         report_id: u32,
         dispute_reason: String,
     ) -> Result<(), ReportingError> {
-        reporter.require_auth();
         pause::require_not_paused(&env)?;
+        reporter.require_auth();
         let _ = (report_id, dispute_reason);
         Ok(())
     }
 
     /// Resolve an active dispute, closing the dispute-resolution workflow.
-    ///
-    /// # Parameters
-    ///
-    /// * `admin`      — Current admin address. Must sign the call.
-    /// * `dispute_id` — Identifier of the dispute to resolve.
-    /// * `resolution` — `true` if the dispute is upheld (reporter wins),
-    ///                  `false` if dismissed.
     ///
     /// # Errors
     ///
@@ -211,12 +226,6 @@ impl ReportingContract {
 
     /// Update the status code of a report.
     ///
-    /// # Parameters
-    ///
-    /// * `admin`      — Current admin address. Must sign the call.
-    /// * `report_id`  — Identifier of the report to update.
-    /// * `new_status` — New numeric status code to assign to the report.
-    ///
     /// # Errors
     ///
     /// * [`ReportingError::ReportingPaused`] — Reporting is currently paused.
@@ -238,14 +247,10 @@ impl ReportingContract {
 
     /// Permanently delete a report by ID.
     ///
-    /// # Parameters
-    ///
-    /// * `admin`     — Current admin address. Must sign the call.
-    /// * `report_id` — Identifier of the report to delete.
-    ///
     /// # Errors
     ///
     /// * [`ReportingError::ReportingPaused`] — Reporting is currently paused.
+    /// * [`ReportingError::ReportNotFound`] — No report with the given ID exists.
     ///
     /// # Auth
     ///
@@ -257,7 +262,35 @@ impl ReportingContract {
     ) -> Result<(), ReportingError> {
         admin.require_auth();
         pause::require_not_paused(&env)?;
-        let _ = report_id;
+
+        let report = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Report>(&DataKey::Report(report_id))
+            .ok_or(ReportingError::ReportNotFound)?;
+
+        let market_key = DataKey::MarketReports(report.market_id);
+        if let Some(mut market_reports) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&market_key)
+        {
+            let mut index = 0;
+            while index < market_reports.len() {
+                if market_reports.get(index) == Some(report_id) {
+                    market_reports.remove(index);
+                    break;
+                }
+                index += 1;
+            }
+            env.storage()
+                .persistent()
+                .set(&market_key, &market_reports);
+        }
+
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Report(report_id));
         Ok(())
     }
 
@@ -269,15 +302,6 @@ impl ReportingContract {
     ///
     /// Calling this when already paused is a no-op (idempotent). A
     /// `reporting_paused` event is emitted only on a state transition.
-    ///
-    /// # Parameters
-    ///
-    /// * `admin` — Current admin address. Must sign the call.
-    ///
-    /// # Errors
-    ///
-    /// * [`ReportingError::NotInitialized`] — Contract has not been
-    ///   initialised; no admin is stored.
     ///
     /// # Auth
     ///
@@ -293,15 +317,6 @@ impl ReportingContract {
     /// Calling this when already unpaused is a no-op (idempotent). A
     /// `reporting_unpaused` event is emitted only on a state transition.
     ///
-    /// # Parameters
-    ///
-    /// * `admin` — Current admin address. Must sign the call.
-    ///
-    /// # Errors
-    ///
-    /// * [`ReportingError::NotInitialized`] — Contract has not been
-    ///   initialised; no admin is stored.
-    ///
     /// # Auth
     ///
     /// Requires a valid signature from `admin`.
@@ -311,23 +326,15 @@ impl ReportingContract {
     }
 
     // -----------------------------------------------------------------------
-    // Ownership
+    // Ownership and read-only views
     // -----------------------------------------------------------------------
 
     /// Transfer contract ownership to a new administrator.
     ///
-    /// The `new_owner` address is validated to ensure it is not the same as
-    /// the current admin (no-op guard) and that it is a well-formed address.
-    ///
-    /// # Parameters
-    ///
-    /// * `admin`     — Current admin address. Must sign the call.
-    /// * `new_owner` — Address of the incoming admin.
-    ///
     /// # Errors
     ///
-    /// * [`ReportingError::InvalidNewOwner`] — `new_owner` is identical to the
-    ///   current admin (self-transfer is rejected to avoid accidents).
+    /// * [`ReportingError::InvalidNewOwner`] — `new_owner` is identical to
+    ///   the current admin.
     ///
     /// # Auth
     ///
@@ -339,8 +346,6 @@ impl ReportingContract {
     ) -> Result<(), ReportingError> {
         admin.require_auth();
 
-        // Reject a self-transfer — it is almost certainly a caller mistake and
-        // provides no value.
         if admin == new_owner {
             return Err(ReportingError::InvalidNewOwner);
         }
@@ -349,24 +354,28 @@ impl ReportingContract {
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Read-only views
-    // -----------------------------------------------------------------------
+    /// Retrieve all report IDs associated with a specific market in submission order.
+    pub fn get_reports_by_market(env: Env, market_id: u32) -> Vec<u32> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Vec<u32>>(&DataKey::MarketReports(market_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Retrieve a specific report by ID.
+    pub fn get_report(env: Env, report_id: u32) -> Result<Report, ReportingError> {
+        env.storage()
+            .persistent()
+            .get::<DataKey, Report>(&DataKey::Report(report_id))
+            .ok_or(ReportingError::ReportNotFound)
+    }
 
     /// Return whether reporting is currently paused.
-    ///
-    /// This is a read-only view; it does **not** require authentication.
     pub fn is_reporting_paused(env: Env) -> bool {
         pause::is_reporting_paused(&env)
     }
 
     /// Return the current admin address.
-    ///
-    /// # Panics
-    ///
-    /// Panics with `"not initialized"` if the contract has not been
-    /// initialised yet. Callers should ensure the contract is initialized
-    /// before querying this view.
     pub fn admin(env: Env) -> Address {
         env.storage()
             .instance()
@@ -374,3 +383,4 @@ impl ReportingContract {
             .expect("not initialized")
     }
 }
+

@@ -1,12 +1,10 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, contracterror, Address, Env, Symbol, Vec, Map, BytesN};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Map, Symbol, Vec,
+};
 
 mod migrate;
-
-use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env,
-};
 
 #[contracttype]
 #[derive(Clone)]
@@ -35,13 +33,6 @@ pub enum ContractError {
     /// Storage migration failed
     MigrationFailed = 7,
 }
-
-/// Storage version key
-const VERSION_KEY: Symbol = Symbol::new("VERSION");
-/// Admin key
-const ADMIN_KEY: Symbol = Symbol::new("ADMIN");
-/// Migration data prefix
-const MIGRATION_PREFIX: Symbol = Symbol::new("MIGRATION_");
 
 /// Migration metadata stored per version upgrade
 #[contracttype]
@@ -90,10 +81,12 @@ impl MigrateContract {
             return Err(ContractError::InvalidTargetVersion);
         }
         
-        if env.storage().instance().has(&VERSION_KEY) {
+        if env.storage().instance().has(&DataKey::Version) {
             return Err(ContractError::AlreadyInitialized);
         }
-        .publish(&env);
+
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Version, &version);
         Ok(())
     }
 
@@ -118,7 +111,8 @@ impl MigrateContract {
     ///
     /// This entrypoint delegates to [`migrate::migrate_error_state`] and
     /// provides the same pre-condition guarantees — version compare-and-set,
-    /// admin authentication, and an extensible data-reshape hook.
+    /// admin authentication, and an extensible data-reshape hook. The stored
+    /// version advances only after every migration step succeeds.
     ///
     /// # Errors
     ///

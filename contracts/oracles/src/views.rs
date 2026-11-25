@@ -19,12 +19,13 @@
 //! |----:|-----------------------|------------------------------------------------------|
 //! |   0 | `GET_PRICE`           | `get_price(oracle, feed)` entrypoint present         |
 //! |   1 | `GET_PRICE_DATA`      | `get_price_data(oracle, feed)` entrypoint present    |
-//! |   2 | `IS_ORACLE_HEALTHY`   | `is_oracle_healthy(oracle)` entrypoint present       |
+//! |   2 | `IS_ORACLE_HEALTHY`   | `is_oracle_healthy(oracle, feed_id)` checks liveness and freshness |
 //! |   3 | `ORACLE_REGISTRY`     | `add_oracle` / `remove_oracle` / `list_oracles` present |
 //! |   4 | `CONFIDENCE_INTERVAL` | `OraclePriceData.confidence` field is populated      |
 //! |   5 | `PRICE_EXPONENT`      | `OraclePriceData.exponent` field is populated        |
 //! |   6 | `TTL_MANAGEMENT`      | Contract bumps ledger TTL on every registry access   |
 //! |   7 | `VERSION_VIEW`        | `version()` read-only view is present                |
+//! |   8 | `CHECK_ORACLE_HEALTH` | `check_oracle_health(oracle, feed)` entrypoint present |
 //!
 //! # Stability guarantee
 //!
@@ -34,6 +35,16 @@
 //! capability *deltas* across upgrades without false-positives.
 
 /// Named bit-flag constants for oracle contract capabilities.
+///
+/// This unit struct is a namespace, not a typed flag set. The contract returns
+/// a `u64` bitmap as its stable ABI, which lets older clients inspect known
+/// bits while preserving unknown bits introduced by future versions. Changing
+/// the return type would change that ABI; wrapping the constants locally would
+/// still require conversion at the contract boundary.
+///
+/// Callers may combine these constants into masks, but such masks are only
+/// client-side checks: the contract emits [`SUPPORTED_CAPABILITIES`] and does
+/// not accept arbitrary capability combinations as input.
 ///
 /// Each constant is a power-of-two `u64` that can be combined with `|` to
 /// form a bitmap, and isolated with `&` to test a specific capability.
@@ -61,10 +72,11 @@ impl CapabilityFlag {
     /// containing price, publish time, confidence interval, and exponent.
     pub const GET_PRICE_DATA: u64 = 1 << 1;
 
-    /// Bit 2 — `is_oracle_healthy(oracle)` entrypoint is present.
+    /// Bit 2 — `is_oracle_healthy(oracle, feed_id)` checks liveness and freshness.
     ///
     /// When set, callers may query whether a registered oracle reports
-    /// itself as live.
+    /// itself as live and provides price data within the configured staleness
+    /// threshold.
     pub const IS_ORACLE_HEALTHY: u64 = 1 << 2;
 
     /// Bit 3 — Oracle registry management is present.
@@ -99,6 +111,9 @@ impl CapabilityFlag {
     /// When set, callers may invoke `version()` to retrieve the contract's
     /// numeric version for compatibility checks.
     pub const VERSION_VIEW: u64 = 1 << 7;
+
+    /// Bit 8 — `check_oracle_health(oracle, feed_id)` checks provider liveness and feed data.
+    pub const CHECK_ORACLE_HEALTH: u64 = 1 << 8;
 }
 
 /// Bitmap of all capability flags supported by this contract build.
@@ -117,7 +132,8 @@ pub const SUPPORTED_CAPABILITIES: u64 = CapabilityFlag::GET_PRICE
     | CapabilityFlag::CONFIDENCE_INTERVAL
     | CapabilityFlag::PRICE_EXPONENT
     | CapabilityFlag::TTL_MANAGEMENT
-    | CapabilityFlag::VERSION_VIEW;
+    | CapabilityFlag::VERSION_VIEW
+    | CapabilityFlag::CHECK_ORACLE_HEALTH;
 
 /// Return the `u64` bitmap of features supported by this oracle contract.
 ///
@@ -172,6 +188,7 @@ mod unit_tests {
             ("PRICE_EXPONENT",     CapabilityFlag::PRICE_EXPONENT),
             ("TTL_MANAGEMENT",     CapabilityFlag::TTL_MANAGEMENT),
             ("VERSION_VIEW",       CapabilityFlag::VERSION_VIEW),
+            ("CHECK_ORACLE_HEALTH", CapabilityFlag::CHECK_ORACLE_HEALTH),
         ];
 
         for (name, value) in flags {
@@ -203,7 +220,8 @@ mod unit_tests {
             | CapabilityFlag::CONFIDENCE_INTERVAL
             | CapabilityFlag::PRICE_EXPONENT
             | CapabilityFlag::TTL_MANAGEMENT
-            | CapabilityFlag::VERSION_VIEW;
+            | CapabilityFlag::VERSION_VIEW
+            | CapabilityFlag::CHECK_ORACLE_HEALTH;
 
         assert_eq!(SUPPORTED_CAPABILITIES, expected);
     }
@@ -225,13 +243,14 @@ mod unit_tests {
         assert_eq!(CapabilityFlag::PRICE_EXPONENT,      1 << 5, "PRICE_EXPONENT must be bit 5");
         assert_eq!(CapabilityFlag::TTL_MANAGEMENT,      1 << 6, "TTL_MANAGEMENT must be bit 6");
         assert_eq!(CapabilityFlag::VERSION_VIEW,        1 << 7, "VERSION_VIEW must be bit 7");
+        assert_eq!(CapabilityFlag::CHECK_ORACLE_HEALTH, 1 << 8, "CHECK_ORACLE_HEALTH must be bit 8");
     }
 
     /// No reserved (undocumented) bits are set in the supported bitmap.
     #[test]
     fn no_reserved_bits_are_set() {
-        // Bits 0-7 are assigned; bits 8-63 must remain clear.
-        let defined_mask: u64 = (1 << 8) - 1; // 0x00FF
+        // Bits 0-8 are assigned; bits 9-63 must remain clear.
+        let defined_mask: u64 = (1 << 9) - 1; // 0x01FF
         assert_eq!(
             SUPPORTED_CAPABILITIES & !defined_mask,
             0,
@@ -254,16 +273,17 @@ mod unit_tests {
         assert_ne!(caps & CapabilityFlag::PRICE_EXPONENT,      0);
         assert_ne!(caps & CapabilityFlag::TTL_MANAGEMENT,      0);
         assert_ne!(caps & CapabilityFlag::VERSION_VIEW,        0);
+        assert_ne!(caps & CapabilityFlag::CHECK_ORACLE_HEALTH, 0);
     }
 
-    /// A hypothetical future flag (bit 8) is not yet set.
+    /// A hypothetical future flag (bit 9) is not yet set.
     #[test]
     fn future_flags_not_yet_set() {
-        let hypothetical_future_flag: u64 = 1 << 8;
+        let hypothetical_future_flag: u64 = 1 << 9;
         assert_eq!(
             capabilities() & hypothetical_future_flag,
             0,
-            "bit 8 must remain clear until officially assigned"
+            "bit 9 must remain clear until officially assigned"
         );
     }
 }

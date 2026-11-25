@@ -1,0 +1,32 @@
+{
+  "contract": "resolution",
+  "description": "Per-entrypoint Soroban budget thresholds for the resolution contract gas snapshot tests. Each entry records the maximum allowed CPU instructions and memory bytes for one entrypoint path, measured against the mock-host budget with an unlimited reset immediately before the call. Tests apply a 5% ceiling on top of these values before asserting, so an SDK update that raises costs by less than 5% will not fail CI. To update a threshold after an intentional cost increase, raise the value here and document the reason in the commit message.",
+  "default_max_regression_pct": 5.0,
+  "thresholds": {
+    "resolve_market_manual": {
+      "max_cpu_insns": 500000,
+      "max_mem_bytes": 150000,
+      "description": "resolve_market_manual happy path and early-exit (not-ended) path"
+    },
+    "resolve_market_with_ties": {
+      "max_cpu_insns": 500000,
+      "max_mem_bytes": 150000,
+      "description": "resolve_market_with_ties with two tied outcomes and single-outcome degenerate path"
+    },
+    "force_resolve_market": {
+      "max_cpu_insns": 500000,
+      "max_mem_bytes": 150000,
+      "description": "force_resolve_market happy path and empty-reason early-exit path"
+    },
+    "resolve_market": {
+      "max_cpu_insns": 500000,
+      "max_mem_bytes": 150000,
+      "description": "resolve_market legacy oracle path (admin and non-admin caller)"
+    },
+    "resolve_dispute": {
+      "max_cpu_insns": 500000,
+      "max_mem_bytes": 150000,
+      "description": "resolve_dispute fast-exit paths (no active dispute, no prior resolution)"
+    }
+  }
+}

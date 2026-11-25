@@ -29,6 +29,7 @@ fn oracle_error_codes_are_stable() {
         (Error::OracleCallbackInvalidSignature, 212u32),
         (Error::OracleCallbackReplayDetected, 213u32),
         (Error::OracleCallbackTimeout, 214u32),
+        (Error::AlreadyInitialized, 215u32),
     ];
 
     for (error, expected_code) in oracle_errors {
@@ -58,6 +59,7 @@ fn oracle_error_codes_are_unique_and_contiguous() {
         Error::OracleCallbackInvalidSignature as u32,
         Error::OracleCallbackReplayDetected as u32,
         Error::OracleCallbackTimeout as u32,
+        Error::AlreadyInitialized as u32,
     ];
 
     for (index, code) in codes.iter().enumerate() {

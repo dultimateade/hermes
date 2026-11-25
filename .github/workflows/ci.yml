@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Verify active Rust toolchain
+        run: |
+          python3 - <<'PY'
+          import subprocess
+          import tomllib
+          from pathlib import Path
+
+          expected = tomllib.loads(Path("rust-toolchain.toml").read_text())["toolchain"]["channel"]
+          active = subprocess.check_output(
+              ["rustup", "show", "active-toolchain"], text=True
+          ).split()[0]
+          host = subprocess.check_output(["rustup", "show", "host"], text=True).strip()
+
+          if active not in (expected, f"{expected}-{host}"):
+              raise SystemExit(
+                  f"Rust toolchain mismatch: expected {expected!r}, got {active!r}"
+              )
+          print(f"Verified active Rust toolchain: {active} (configured: {expected})")
+          PY
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        run: |
+          cargo audit --json > cargo-audit-report.json || true
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path("cargo-audit-report.json").read_text() or "{}")
+          blocking = {"critical", "high"}
+          failures = []
+
+          for entry in report.get("vulnerabilities", {}).get("list", []):
+              advisory = entry.get("advisory", {})
+              severity = str(advisory.get("severity") or "").lower()
+              if severity in blocking:
+                  package = entry.get("package", {})
+                  failures.append(
+                      f"{advisory.get('id', 'unknown')} ({severity}) in "
+                      f"{package.get('name', '?')} {package.get('version', '?')}: "
+                      f"{advisory.get('title', '')}"
+                  )
+
+          if failures:
+              print("Blocking advisories detected:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+
+          print("No CRITICAL or HIGH severity advisories detected.")
+          PY
+      - name: Run workspace tests
+        run: cargo test --workspace
+      - name: Verify committed snapshot goldens
+        env:
+          SNAPSHOT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if ! git cat-file -e "${SNAPSHOT_BASE}^{commit}" 2>/dev/null; then
+            SNAPSHOT_BASE="$(git rev-parse HEAD^)"
+          fi
+
+          deleted_snapshots="$(git diff --diff-filter=D --name-only "${SNAPSHOT_BASE}...HEAD" -- 'contracts/**/test_snapshots/**' ':(exclude)contracts/oracles/test_snapshots/**')"
+          if [[ -n "$deleted_snapshots" ]]; then
+            printf 'Snapshot goldens were deleted relative to the base revision:\n%s\n' "$deleted_snapshots"
+            exit 1
+          fi
+
+          tracked_snapshots="$(git ls-files -- 'contracts/**/test_snapshots/**' ':(exclude)contracts/oracles/test_snapshots/**' | sort)"
+          generated_snapshots="$(find contracts -type f -path '*/test_snapshots/*' ! -path 'contracts/oracles/test_snapshots/*' -print | sort)"
+          if [[ "$tracked_snapshots" != "$generated_snapshots" ]]; then
+            printf 'Snapshot files do not match the committed inventory:\n'
+            diff -u <(printf '%s\n' "$tracked_snapshots") <(printf '%s\n' "$generated_snapshots") || true
+            exit 1
+          fi
+
+          if ! git diff --quiet HEAD -- 'contracts/**/test_snapshots/**' ':(exclude)contracts/oracles/test_snapshots/**'; then
+            printf 'Snapshot goldens changed during the test run:\n'
+            git diff -- 'contracts/**/test_snapshots/**'
+            exit 1
+          fi

@@ -1,0 +1,138 @@
+name: Nightly Performance Benchmarks
+
+on:
+  schedule:
+    # Run nightly at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'contracts/analytics/**'
+      - 'contracts/markets/**'
+      - 'benchmarks/**'
+      - 'scripts/check_benchmarks.*'
+      - '.github/workflows/*bench*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark-analytics:
+    name: Analytics Benchmark & Regression Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Analytics Benchmarks with Regression Checks
+        run: |
+          chmod +x scripts/check_benchmarks.sh
+          python3 scripts/check_benchmarks.py --contract analytics --thresholds contracts/analytics/benches/thresholds.json
+
+      - name: Upload Benchmark Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: analytics-benchmark-report
+          path: |
+            benchmark_report.md
+            benchmark_results.json
+            target/criterion
+          if-no-files-found: ignore
+
+  benchmark-markets:
+    name: Markets Benchmark & Regression Check (5% threshold)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Run Markets Benchmarks with Regression Checks
+        run: |
+          python3 scripts/check_benchmarks.py \
+            --contract markets \
+            --thresholds contracts/markets/benches/thresholds.json
+
+      - name: Compare Against Committed Baseline
+        run: |
+          python3 - <<'EOF'
+          import json, sys
+          from pathlib import Path
+
+          baseline_path = Path("benchmarks/baseline.json")
+          results_path  = Path("benchmark_results.json")
+
+          if not baseline_path.exists():
+              print("ERROR: benchmarks/baseline.json not found", file=sys.stderr)
+              sys.exit(1)
+          if not results_path.exists():
+              print("ERROR: benchmark_results.json not found – cannot verify regressions", file=sys.stderr)
+              sys.exit(1)
+
+          baseline = json.loads(baseline_path.read_text())
+          results  = json.loads(results_path.read_text())
+
+          baseline_benches = baseline.get("benchmarks", {})
+          result_list      = {r["name"]: r for r in results.get("results", [])}
+
+          # Hard ceiling: any entrypoint regressing more than 10% fails the build.
+          # An entry may opt into a stricter limit via its own max_regression_pct.
+          regression_limit = 10.0  # percent
+          failures = []
+
+          for name, bdata in baseline_benches.items():
+              if name not in result_list:
+                  print(f"  SKIP  {name} – not present in current results")
+                  continue
+              current_ns = result_list[name].get("mean_ns")
+              baseline_ns = bdata.get("mean_ns")
+              if current_ns is None or baseline_ns is None:
+                  continue
+              pct_change = ((current_ns - baseline_ns) / baseline_ns) * 100.0
+              limit = min(bdata.get("max_regression_pct", regression_limit), regression_limit)
+              status = "PASS" if pct_change <= limit else "FAIL"
+              print(f"  {status}  {name}: {baseline_ns:.0f} ns → {current_ns:.0f} ns  ({pct_change:+.2f}%, limit {limit:.1f}%)")
+              if status == "FAIL":
+                  failures.append(f"{name}: +{pct_change:.2f}% regression (limit {limit:.1f}%)")
+
+          if failures:
+              print("\n❌ Baseline regression check failed:")
+              for f in failures:
+                  print(f"   - {f}")
+              sys.exit(1)
+          else:
+              print("\n✅ All benchmarks within 10% of committed baseline.")
+          EOF
+
+      - name: Upload Markets Benchmark Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: markets-benchmark-report
+          path: |
+            benchmark_report.md
+            benchmark_results.json
+            target/criterion
+          if-no-files-found: ignore

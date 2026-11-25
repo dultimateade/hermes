@@ -18,8 +18,20 @@ use std::env;
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
 
-    // Rerun if the error registry changes
+    // Rerun only when an input to this script changes.
+    //
+    // Without these directives Cargo treats the script as having no declared
+    // inputs and re-runs it on every build invocation, even when nothing has
+    // changed.  Listing every file that can affect the output lets Cargo skip
+    // the script on incremental builds where none of them are dirty.
+    //
+    // Three inputs matter:
+    //   1. This script itself — logic changes must trigger a re-run.
+    //   2. The error registry — the source of truth for error codes/messages.
+    //   3. The codegen crate — changes here alter what gets written to OUT_DIR.
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../crates/hermes-errors/src/lib.rs");
+    println!("cargo:rerun-if-changed=../../crates/hermes-codegen/src/lib.rs");
 
     // Filter errors for this contract
     let analytics_errors: Vec<_> = all_errors()

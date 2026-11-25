@@ -20,6 +20,8 @@
 //! | `initialize`            | Admin (caller)          |
 //! | `register_validator`    | Validator (self)        |
 //! | `deregister_validator`  | Validator (self)        |
+//! | `start_resolution_round`| Admin                   |
+//! | `end_resolution_round`  | Admin                   |
 //! | `update_stake`          | Validator (self)        |
 //! | `set_validator_active`  | Admin                   |
 //! | `update_score`          | Admin                   |
@@ -30,6 +32,7 @@
 //! | `get_validator`         | Anyone (read-only)      |
 //! | `is_validator`          | Anyone (read-only)      |
 //! | `validator_count`       | Anyone (read-only)      |
+//! | `list_validators`       | Anyone (read-only)      |
 //! | `is_validators_paused`  | Anyone (read-only)      |
 //! | `admin`                 | Anyone (read-only)      |
 //! | `version`               | Anyone (read-only)      |
@@ -42,7 +45,7 @@ mod types;
 pub use errors::ValidatorError;
 pub use types::{DataKey, ValidatorInfo};
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env};
+use soroban_sdk::{contract, contractimpl, panic_with_error, Address, Env, Vec};
 
 /// The Validators contract.
 ///
@@ -105,6 +108,9 @@ impl ValidatorsContract {
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorCount, &0u32);
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::MinStake, &min_stake);
         env.storage().instance().set(&DataKey::MaxStake, &max_stake);
 
@@ -200,6 +206,15 @@ impl ValidatorsContract {
         env.storage()
             .persistent()
             .set(&DataKey::Validator(validator), &info);
+        let mut validators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        validators.push_back(info.address.clone());
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &validators);
         env.storage()
             .persistent()
             .set(&DataKey::ValidatorCount, &new_count);
@@ -219,7 +234,9 @@ impl ValidatorsContract {
     /// 2. Ensures the contract is initialized and not paused.
     /// 3. Panics with [`ValidatorError::ValidatorNotFound`] if the address is
     ///    unknown.
-    /// 4. Removes the persistent record and decrements `ValidatorCount`.
+    /// 4. Rejects deregistration if the validator is in an active resolution
+    ///    round.
+    /// 5. Removes the persistent record and decrements `ValidatorCount`.
     ///
     /// # Why auth is required
     /// Without auth, any account could remove a validator's registration,
@@ -232,18 +249,38 @@ impl ValidatorsContract {
     /// * [`ValidatorError::NotInitialized`]    — contract not yet initialized.
     /// * [`ValidatorError::ValidatorsPaused`]  — subsystem is paused.
     /// * [`ValidatorError::ValidatorNotFound`] — address is not registered.
+    /// * [`ValidatorError::ValidatorInActiveRound`] — validator is participating
+    ///   in an active resolution round.
     pub fn deregister_validator(env: Env, validator: Address) -> Result<(), ValidatorError> {
         validator.require_auth();
 
         Self::assert_initialized(&env)?;
         Self::assert_not_paused(&env)?;
 
-        let key = DataKey::Validator(validator);
+        let key = DataKey::Validator(validator.clone());
         if !env.storage().persistent().has(&key) {
             return Err(ValidatorError::ValidatorNotFound);
         }
+        if Self::has_active_round(&env, &validator) {
+            return Err(ValidatorError::ValidatorInActiveRound);
+        }
 
         env.storage().persistent().remove(&key);
+
+        let registered: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut remaining = Vec::new(&env);
+        for address in registered.iter() {
+            if address != validator {
+                remaining.push_back(address);
+            }
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::ValidatorList, &remaining);
 
         let count: u32 = env
             .storage()
@@ -254,6 +291,62 @@ impl ValidatorsContract {
             .persistent()
             .set(&DataKey::ValidatorCount, &count.saturating_sub(1));
 
+        Ok(())
+    }
+
+    /// Mark `validator` as participating in an active resolution round.
+    ///
+    /// The resolution orchestrator must call this when a validator enters a
+    /// round, and call [`Self::end_resolution_round`] when that round concludes.
+    /// Only the validator contract admin may update this lifecycle flag.
+    ///
+    /// # Errors
+    /// * [`ValidatorError::NotInitialized`] — contract not yet initialized.
+    /// * [`ValidatorError::Unauthorized`] — caller is not the contract admin.
+    /// * [`ValidatorError::ValidatorNotFound`] — `validator` is not registered.
+    pub fn start_resolution_round(
+        env: Env,
+        admin: Address,
+        validator: Address,
+    ) -> Result<(), ValidatorError> {
+        admin.require_auth();
+
+        Self::assert_initialized(&env)?;
+        Self::assert_is_admin(&env, &admin)?;
+        if !env
+            .storage()
+            .persistent()
+            .has(&DataKey::Validator(validator.clone()))
+        {
+            return Err(ValidatorError::ValidatorNotFound);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::ActiveRound(validator), &true);
+        Ok(())
+    }
+
+    /// Clear `validator`'s active-round flag after the resolution round concludes.
+    ///
+    /// This remains available while validators are paused so a completed round
+    /// can always release its participants.
+    ///
+    /// # Errors
+    /// * [`ValidatorError::NotInitialized`] — contract not yet initialized.
+    /// * [`ValidatorError::Unauthorized`] — caller is not the contract admin.
+    pub fn end_resolution_round(
+        env: Env,
+        admin: Address,
+        validator: Address,
+    ) -> Result<(), ValidatorError> {
+        admin.require_auth();
+
+        Self::assert_initialized(&env)?;
+        Self::assert_is_admin(&env, &admin)?;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::ActiveRound(validator));
         Ok(())
     }
 
@@ -646,6 +739,20 @@ impl ValidatorsContract {
             .has(&DataKey::Validator(validator))
     }
 
+    /// Return whether `validator` is currently participating in a resolution round.
+    ///
+    /// Returns `false` if the validator has no active-round flag.
+    pub fn is_validator_in_active_round(env: Env, validator: Address) -> bool {
+        Self::has_active_round(&env, &validator)
+    }
+
+    fn has_active_round(env: &Env, validator: &Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ActiveRound(validator.clone()))
+            .unwrap_or(false)
+    }
+
     /// Return the total number of currently registered validators.
     ///
     /// # What it does
@@ -662,6 +769,30 @@ impl ValidatorsContract {
             .persistent()
             .get(&DataKey::ValidatorCount)
             .unwrap_or(0)
+    }
+
+    /// Return a page of registered validator addresses in registration order.
+    ///
+    /// `start` is a zero-based offset and `limit` is the maximum number of
+    /// addresses to return. Deregistered validators are omitted; a validator
+    /// that registers again is appended to the end of the list.
+    pub fn list_validators(env: Env, start: u32, limit: u32) -> Vec<Address> {
+        let validators: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::ValidatorList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut page = Vec::new(&env);
+        let mut index = start;
+
+        while index < validators.len() && page.len() < limit {
+            if let Some(address) = validators.get(index) {
+                page.push_back(address);
+            }
+            index += 1;
+        }
+
+        page
     }
 
     /// Return whether the validators subsystem is currently paused.

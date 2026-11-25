@@ -34,6 +34,12 @@ pub enum ContractError {
     OracleResultNotAvailable = 10,
     /// Invalid winning outcomes; thrown when the winning outcomes list is empty or invalid.
     InvalidWinningOutcomes = 11,
+    /// Markets contract address failed version validation at initialization or resolution time.
+    /// Thrown when the cross-contract `version()` call returns an unexpected value or fails.
+    MarketsContractInvalid = 12,
+    /// Markets contract version changed between initialization and a resolution call.
+    /// Thrown when the live `version()` no longer matches the value stored at initialization.
+    MarketsVersionMismatch = 13,
 }
 
 #[cfg(test)]
@@ -54,5 +60,7 @@ mod tests {
         assert_eq!(ContractError::ResolutionCooldownActive as u32, 9);
         assert_eq!(ContractError::OracleResultNotAvailable as u32, 10);
         assert_eq!(ContractError::InvalidWinningOutcomes as u32, 11);
+        assert_eq!(ContractError::MarketsContractInvalid as u32, 12);
+        assert_eq!(ContractError::MarketsVersionMismatch as u32, 13);
     }
 }

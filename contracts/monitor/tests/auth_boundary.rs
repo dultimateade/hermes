@@ -75,23 +75,49 @@ fn test_initialize_requires_admin_auth() {
 // set_caps
 // ---------------------------------------------------------------------------
 
+/// Every CapType variant must record admin auth when set_caps succeeds.
+///
+/// Iterating over all variants here means a new CapType added to limits.rs
+/// only requires adding it to this slice — the auth property is then tested
+/// automatically without further changes to this file.
 #[test]
-fn test_set_caps_emits_admin_auth() {
-    let (env, s) = setup();
-    s.client.set_caps(&s.admin, &CapType::Bets, &5u32);
+fn test_set_caps_emits_admin_auth_for_all_cap_types() {
+    const ALL_CAP_TYPES: &[CapType] = &[
+        CapType::Bets,
+        CapType::Positions,
+        CapType::Subscriptions,
+    ];
 
-    let auths = env.auths();
-    assert!(
-        auths.iter().any(|(addr, _)| addr == &s.admin),
-        "admin auth must appear after set_caps"
-    );
+    for cap_type in ALL_CAP_TYPES {
+        let (env, s) = setup();
+        s.client.set_caps(&s.admin, cap_type, &5u32);
+
+        let auths = env.auths();
+        assert!(
+            auths.iter().any(|(addr, _)| addr == &s.admin),
+            "admin auth must appear after set_caps for {cap_type:?}"
+        );
+    }
 }
 
+/// Every CapType variant must reject a non-admin caller with Unauthorized.
 #[test]
-fn test_set_caps_non_admin_is_rejected() {
-    let (_env, s) = setup();
-    let result = s.client.try_set_caps(&s.user, &CapType::Bets, &5u32);
-    assert_eq!(result, Ok(Err(MonitorError::Unauthorized)));
+fn test_set_caps_non_admin_is_rejected_for_all_cap_types() {
+    const ALL_CAP_TYPES: &[CapType] = &[
+        CapType::Bets,
+        CapType::Positions,
+        CapType::Subscriptions,
+    ];
+
+    for cap_type in ALL_CAP_TYPES {
+        let (_env, s) = setup();
+        let result = s.client.try_set_caps(&s.user, cap_type, &5u32);
+        assert_eq!(
+            result,
+            Ok(Err(MonitorError::Unauthorized)),
+            "non-admin must be rejected for {cap_type:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

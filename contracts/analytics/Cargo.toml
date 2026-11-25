@@ -2,17 +2,30 @@
 name = "analytics"
 version = "0.1.0"
 edition = "2021"
+autotests = false
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["lib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
 
+[build-dependencies]
+hermes-codegen = { path = "../../crates/hermes-codegen" }
+hermes-errors = { path = "../../crates/hermes-errors" }
+
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
+criterion = { workspace = true }
+
+[[test]]
+name = "err_stab"
+path = "tests/err_stab.rs"
+
+[[test]]
+name = "time_series"
+path = "tests/time_series.rs"
 
 [[bench]]
 name = "main"
 harness = false
-

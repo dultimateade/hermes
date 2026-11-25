@@ -1,0 +1,22 @@
+[package]
+name = "markets-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata.cargo-fuzz]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1.3", features = ["derive"] }
+markets = { path = ".." }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[[bin]]
+name = "place_bet"
+path = "targets/place_bet.rs"
+
+[[bin]]
+name = "claim_winnings"
+path = "targets/claim_winnings.rs"

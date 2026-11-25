@@ -128,6 +128,7 @@ its call site(s), not just its name.
 | `UserLastBetTime(Symbol, Address)` | *(unused)* | Declared to support a per-(market, user) cool-off timer; no current call site. Per-entity data of this shape would need Persistent once wired up, matching `UserStake`. |
 | `CoolOffPeriod` | *(unused)* | Declared for a global cool-off period in seconds; no current call site. |
 | `PerMarketCoolOff(Symbol)` | *(unused)* | Declared for a per-market cool-off override; no current call site. |
+| `MaxOutcomesPerMarket` | Persistent | Admin-configurable cap on the number of outcomes a market may declare ([`markets.rs`](../src/markets.rs)). A single global config value read on every market creation, so it must survive across ledgers; extended to `MARKET_TTL_LEDGERS` alongside the markets it governs. Absent means `DEFAULT_MAX_OUTCOMES_PER_MARKET` (10) applies. |
 
 ### Dual-tier keys: `MarketMetadata` / `MarketScratch`
 

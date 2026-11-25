@@ -290,13 +290,16 @@ impl MonitorContract {
     // Read-only queries
     // -----------------------------------------------------------------------
 
-    /// Return the current state counts for `user`.
+    /// Return the current state counts for `user`, or `None` if the account
+    /// has never interacted with this contract.
     ///
     /// No authentication required; counts are public ledger state.
     ///
-    /// Returns an [`AccountState`] with all counts as zero if the user has no
-    /// recorded activity.
-    pub fn get_account_state(env: Env, user: Address) -> AccountState {
+    /// Returns `None` for accounts that have never called `record_bet`,
+    /// `record_position`, or `record_subscription`.  Returns `Some` once any
+    /// of those entrypoints has been called at least once, even if all
+    /// counters have subsequently been decremented back to zero.
+    pub fn get_account_state(env: Env, user: Address) -> Option<AccountState> {
         limits::load_account_state(&env, &user)
     }
 

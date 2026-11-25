@@ -21,3 +21,7 @@ path = "tests/auth_boundary.rs"
 [[test]]
 name = "err_stab"
 path = "tests/err_stab.rs"
+
+[[test]]
+name = "fees_lifecycle"
+path = "tests/fees_lifecycle.rs"

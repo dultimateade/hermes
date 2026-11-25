@@ -190,7 +190,7 @@ fn test_record_bet_increments_to_one() {
     let (_env, setup) = setup();
     let count = setup.client.record_bet(&setup.user1);
     assert_eq!(count, 1);
-    assert_eq!(setup.client.get_account_state(&setup.user1).bets, 1);
+    assert_eq!(setup.client.get_account_state(&setup.user1).unwrap().bets, 1);
 }
 
 #[test]
@@ -247,13 +247,25 @@ fn test_record_bet_after_remove_succeeds() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_record_bet_exceeds_cap_returns_error() {
+fn test_record_bets_exactly_at_cap_then_rejects_next() {
     let (_env, setup) = setup();
     setup
         .client
-        .set_caps(&setup.admin, &CapType::Bets, &2u32);
-    setup.client.record_bet(&setup.user1);
-    setup.client.record_bet(&setup.user1);
+        .set_caps(&setup.admin, &CapType::Bets, &3u32);
+    let caps = setup.client.get_caps();
+
+    for expected_count in 1..=caps.max_bets {
+        assert_eq!(
+            setup.client.record_bet(&setup.user1),
+            expected_count,
+            "recording bet {expected_count} should succeed up to max_bets"
+        );
+    }
+    assert_eq!(
+        setup.client.get_account_state(&setup.user1).unwrap().bets,
+        caps.max_bets
+    );
+
     let result = setup.client.try_record_bet(&setup.user1);
     assert_eq!(result, Ok(Err(MonitorError::BetCapExceeded)));
 }
@@ -391,8 +403,8 @@ fn test_counts_are_per_account() {
     setup.client.record_bet(&setup.user1);
     setup.client.record_bet(&setup.user2);
 
-    assert_eq!(setup.client.get_account_state(&setup.user1).bets, 2);
-    assert_eq!(setup.client.get_account_state(&setup.user2).bets, 1);
+    assert_eq!(setup.client.get_account_state(&setup.user1).unwrap().bets, 2);
+    assert_eq!(setup.client.get_account_state(&setup.user2).unwrap().bets, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -400,16 +412,45 @@ fn test_counts_are_per_account() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_get_account_state_all_zero_for_new_user() {
+fn test_get_account_state_returns_none_for_new_user() {
     let (_env, setup) = setup();
-    let state = setup.client.get_account_state(&setup.user1);
+    assert_eq!(setup.client.get_account_state(&setup.user1), None);
+}
+
+#[test]
+fn test_get_account_state_returns_some_after_first_record_bet() {
+    let (_env, setup) = setup();
+    setup.client.record_bet(&setup.user1);
+    assert!(setup.client.get_account_state(&setup.user1).is_some());
+}
+
+#[test]
+fn test_get_account_state_returns_some_after_first_record_position() {
+    let (_env, setup) = setup();
+    setup.client.record_position(&setup.user1);
+    assert!(setup.client.get_account_state(&setup.user1).is_some());
+}
+
+#[test]
+fn test_get_account_state_returns_some_after_first_record_subscription() {
+    let (_env, setup) = setup();
+    setup.client.record_subscription(&setup.user1);
+    assert!(setup.client.get_account_state(&setup.user1).is_some());
+}
+
+#[test]
+fn test_get_account_state_remains_some_after_all_decremented_to_zero() {
+    let (_env, setup) = setup();
+    setup.client.record_bet(&setup.user1);
+    setup.client.remove_bet(&setup.user1);
+    // Account is tracked even though every counter is back at zero.
     assert_eq!(
-        state,
-        AccountState {
+        setup.client.get_account_state(&setup.user1),
+        Some(AccountState {
             bets: 0,
             positions: 0,
             subscriptions: 0,
-        }
+        })
     );
 }
 
@@ -423,7 +464,7 @@ fn test_get_account_state_reflects_all_resource_types() {
     setup.client.record_subscription(&setup.user1);
     setup.client.record_subscription(&setup.user1);
 
-    let state = setup.client.get_account_state(&setup.user1);
+    let state = setup.client.get_account_state(&setup.user1).unwrap();
     assert_eq!(state.bets, 2);
     assert_eq!(state.positions, 1);
     assert_eq!(state.subscriptions, 3);
@@ -682,4 +723,254 @@ fn test_different_resource_types_are_independent() {
     assert_eq!(bet_count, 1);
     let pos_count = setup.client.record_position(&setup.user1);
     assert_eq!(pos_count, 1);
+}
+
+// ---------------------------------------------------------------------------
+// §18 Per-type cap boundary: cap−1 (succeeds), cap (succeeds then blocked),
+//     cap+1 attempt (blocked a second time).
+//
+// For each CapType the fixture sets the cap to N=5, then:
+//   - fills to N−1  → last record call succeeds and returns N−1
+//   - records once more (count becomes N)  → succeeds and returns N
+//   - tries to record again (would be N+1) → CapExceeded error
+//
+// A second try_record confirms the error is stable (not a one-shot latch).
+// ---------------------------------------------------------------------------
+
+// --- Bets ---
+
+/// Record N−1 bets: each call must succeed, final count must equal N−1.
+#[test]
+fn test_bets_cap_minus_one_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Bets, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_bet(&setup.user1);
+    }
+
+    let state = setup.client.get_account_state(&setup.user1).unwrap();
+    assert_eq!(state.bets, CAP - 1);
+}
+
+/// Record exactly N bets (the cap): the N-th call must succeed and return N.
+#[test]
+fn test_bets_at_cap_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Bets, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_bet(&setup.user1);
+    }
+    let count = setup.client.record_bet(&setup.user1);
+
+    assert_eq!(count, CAP);
+}
+
+/// Attempt to record a bet beyond the cap (N+1): must return BetCapExceeded,
+/// and a second attempt must return the same error (not a one-shot latch).
+#[test]
+fn test_bets_cap_plus_one_rejected() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Bets, &CAP);
+
+    for _ in 0..CAP {
+        setup.client.record_bet(&setup.user1);
+    }
+
+    assert_eq!(
+        setup.client.try_record_bet(&setup.user1),
+        Ok(Err(MonitorError::BetCapExceeded))
+    );
+    // Second attempt: error must be stable, not a one-shot latch.
+    assert_eq!(
+        setup.client.try_record_bet(&setup.user1),
+        Ok(Err(MonitorError::BetCapExceeded))
+    );
+}
+
+// --- Positions ---
+
+/// Record N−1 positions: each call must succeed, final count must equal N−1.
+#[test]
+fn test_positions_cap_minus_one_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Positions, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_position(&setup.user1);
+    }
+
+    let state = setup.client.get_account_state(&setup.user1).unwrap();
+    assert_eq!(state.positions, CAP - 1);
+}
+
+/// Record exactly N positions (the cap): the N-th call must succeed and return N.
+#[test]
+fn test_positions_at_cap_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Positions, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_position(&setup.user1);
+    }
+    let count = setup.client.record_position(&setup.user1);
+
+    assert_eq!(count, CAP);
+}
+
+/// Attempt to record a position beyond the cap (N+1): must return
+/// PositionCapExceeded, and a second attempt must return the same error.
+#[test]
+fn test_positions_cap_plus_one_rejected() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup.client.set_caps(&setup.admin, &CapType::Positions, &CAP);
+
+    for _ in 0..CAP {
+        setup.client.record_position(&setup.user1);
+    }
+
+    assert_eq!(
+        setup.client.try_record_position(&setup.user1),
+        Ok(Err(MonitorError::PositionCapExceeded))
+    );
+    assert_eq!(
+        setup.client.try_record_position(&setup.user1),
+        Ok(Err(MonitorError::PositionCapExceeded))
+    );
+}
+
+// --- Subscriptions ---
+
+/// Record N−1 subscriptions: each call must succeed, final count must equal N−1.
+#[test]
+fn test_subscriptions_cap_minus_one_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup
+        .client
+        .set_caps(&setup.admin, &CapType::Subscriptions, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_subscription(&setup.user1);
+    }
+
+    let state = setup.client.get_account_state(&setup.user1).unwrap();
+    assert_eq!(state.subscriptions, CAP - 1);
+}
+
+/// Record exactly N subscriptions (the cap): the N-th call must succeed and
+/// return N.
+#[test]
+fn test_subscriptions_at_cap_succeeds() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup
+        .client
+        .set_caps(&setup.admin, &CapType::Subscriptions, &CAP);
+
+    for _ in 0..CAP - 1 {
+        setup.client.record_subscription(&setup.user1);
+    }
+    let count = setup.client.record_subscription(&setup.user1);
+
+    assert_eq!(count, CAP);
+}
+
+/// Attempt to record a subscription beyond the cap (N+1): must return
+/// SubscriptionCapExceeded, and a second attempt must return the same error.
+#[test]
+fn test_subscriptions_cap_plus_one_rejected() {
+    const CAP: u32 = 5;
+    let (_env, setup) = setup();
+    setup
+        .client
+        .set_caps(&setup.admin, &CapType::Subscriptions, &CAP);
+
+    for _ in 0..CAP {
+        setup.client.record_subscription(&setup.user1);
+    }
+
+    assert_eq!(
+        setup.client.try_record_subscription(&setup.user1),
+        Ok(Err(MonitorError::SubscriptionCapExceeded))
+    );
+    assert_eq!(
+        setup.client.try_record_subscription(&setup.user1),
+        Ok(Err(MonitorError::SubscriptionCapExceeded))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §19 Per-type cap boundary at default cap values
+//
+// Drives each resource type all the way to its compile-time default cap
+// without calling set_caps, so a bug in the fallback `.unwrap_or(DEFAULT_*)` 
+// path or in the default constants themselves is caught here.
+// ---------------------------------------------------------------------------
+
+/// Drive bets to the default cap (50): the 50th record must succeed; the 51st
+/// must return BetCapExceeded.
+#[test]
+fn test_bets_default_cap_boundary() {
+    let (_env, setup) = setup();
+    // Default cap is DEFAULT_MAX_BETS = 50; no set_caps call.
+    for _ in 0..49 {
+        setup.client.record_bet(&setup.user1);
+    }
+    // 50th — must succeed (count == cap).
+    let count = setup.client.record_bet(&setup.user1);
+    assert_eq!(count, 50);
+
+    // 51st — must fail.
+    assert_eq!(
+        setup.client.try_record_bet(&setup.user1),
+        Ok(Err(MonitorError::BetCapExceeded))
+    );
+}
+
+/// Drive positions to the default cap (20): the 20th record must succeed; the
+/// 21st must return PositionCapExceeded.
+#[test]
+fn test_positions_default_cap_boundary() {
+    let (_env, setup) = setup();
+    // Default cap is DEFAULT_MAX_POSITIONS = 20; no set_caps call.
+    for _ in 0..19 {
+        setup.client.record_position(&setup.user1);
+    }
+    // 20th — must succeed (count == cap).
+    let count = setup.client.record_position(&setup.user1);
+    assert_eq!(count, 20);
+
+    // 21st — must fail.
+    assert_eq!(
+        setup.client.try_record_position(&setup.user1),
+        Ok(Err(MonitorError::PositionCapExceeded))
+    );
+}
+
+/// Drive subscriptions to the default cap (10): the 10th record must succeed;
+/// the 11th must return SubscriptionCapExceeded.
+#[test]
+fn test_subscriptions_default_cap_boundary() {
+    let (_env, setup) = setup();
+    // Default cap is DEFAULT_MAX_SUBSCRIPTIONS = 10; no set_caps call.
+    for _ in 0..9 {
+        setup.client.record_subscription(&setup.user1);
+    }
+    // 10th — must succeed (count == cap).
+    let count = setup.client.record_subscription(&setup.user1);
+    assert_eq!(count, 10);
+
+    // 11th — must fail.
+    assert_eq!(
+        setup.client.try_record_subscription(&setup.user1),
+        Ok(Err(MonitorError::SubscriptionCapExceeded))
+    );
 }

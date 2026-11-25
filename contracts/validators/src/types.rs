@@ -23,6 +23,10 @@ pub enum DataKey {
     MinStake,
     /// Global maximum stake cap per validator (in stroops).
     MaxStake,
+    /// Whether the validator is participating in an active resolution round.
+    ActiveRound(soroban_sdk::Address),
+    /// Ordered list of currently registered validator addresses.
+    ValidatorList,
 }
 
 /// On-chain representation of a registered validator.

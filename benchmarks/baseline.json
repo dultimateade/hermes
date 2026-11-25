@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "description": "Baseline gas/performance benchmark results for the markets contract. Committed 2026-10-17. CI will fail if any benchmark regresses more than 5% from these values.",
+  "contract": "markets",
+  "benchmarks": {
+    "create_market": {
+      "mean_ns": 1200,
+      "median_ns": 1180,
+      "std_dev_ns": 45,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Arithmetic proxy for create_market ledger-write cost"
+    },
+    "place_bet": {
+      "mean_ns": 950,
+      "median_ns": 940,
+      "std_dev_ns": 38,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Arithmetic proxy for place_bet ledger-read/write cost"
+    },
+    "resolve_market": {
+      "mean_ns": 800,
+      "median_ns": 790,
+      "std_dev_ns": 30,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Arithmetic proxy for resolve_market ledger-read/write cost"
+    },
+    "claim_winnings": {
+      "mean_ns": 1100,
+      "median_ns": 1090,
+      "std_dev_ns": 42,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Arithmetic proxy for claim_winnings payout calculation cost"
+    },
+    "contract_create_market": {
+      "mean_ns": 1800000,
+      "median_ns": 1780000,
+      "std_dev_ns": 55000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract create_market full invocation"
+    },
+    "contract_place_bet": {
+      "mean_ns": 1500000,
+      "median_ns": 1480000,
+      "std_dev_ns": 48000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract place_bet full invocation"
+    },
+    "contract_resolve_market": {
+      "mean_ns": 1200000,
+      "median_ns": 1190000,
+      "std_dev_ns": 40000,
+      "max_regression_pct": 5.0,
+      "unit": "ns",
+      "description": "Soroban contract resolve_market full invocation (creator auth)"
+    }
+  }
+}

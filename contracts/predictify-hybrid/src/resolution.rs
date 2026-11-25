@@ -1360,6 +1360,7 @@ impl MarketResolutionManager {
             &env, &market_id, env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes_vec);
         let _ = resolution::ResolutionOutcomeCache::refresh(&env, &market_id);
@@ -1412,6 +1413,7 @@ impl MarketResolutionManager {
             &env, &market_id, env.ledger().timestamp(),
         );
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         let _ = bets::BetManager::resolve_market_bets(&env, &market_id, &winning_outcomes);
         let _ = resolution::ResolutionOutcomeCache::refresh(&env, &market_id);
@@ -1469,6 +1471,7 @@ impl MarketResolutionManager {
         );
 
         env.storage().persistent().set(&market_id, &market);
+        crate::markets::MarketReadCache::new(&env).invalidate(&market_id);
 
         crate::force_resolve::ForceResolveManager::mark_resolved(
             &env, &market_id, &idempotency_key, &admin, &winning_outcomes,

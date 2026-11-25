@@ -1,0 +1,16 @@
+# Global Cargo configuration for consistent WASM optimization
+# Ensures all WASM contracts are built with optimal size and LTO settings
+
+[build]
+target-dir = "target"
+
+# Apply release optimizations to all WASM targets
+[profile.release]
+opt-level = "z"
+overflow-checks = true
+debug = 0
+strip = "symbols"
+debug-assertions = false
+panic = "abort"
+codegen-units = 1
+lto = true

@@ -5,6 +5,10 @@
 //! They are intentionally brittle: if a discriminant changes, these tests
 //! fail immediately, alerting the author that they have introduced a breaking
 //! change to the on-chain ABI.
+//!
+//! `test_all_variants_are_covered` uses an exhaustive `match` so that adding
+//! a new variant to `MonitorError` without updating this file causes a
+//! **compile error**, not a silent gap in coverage.
 
 #![cfg(test)]
 
@@ -34,4 +38,26 @@ fn test_debug_format_does_not_panic() {
     let _ = format!("{:?}", MonitorError::InvalidInput);
     let _ = format!("{:?}", MonitorError::Overflow);
     let _ = format!("{:?}", MonitorError::Underflow);
+}
+
+/// Exhaustive match over every `MonitorError` variant.
+///
+/// This function is **not a test** — it never runs.  Its sole purpose is to
+/// produce a compile error if a new variant is added to `MonitorError` without
+/// a corresponding arm here.  Add the new arm, pin its discriminant in
+/// `test_error_discriminants_are_stable`, and add its `Debug` call in
+/// `test_debug_format_does_not_panic`.
+#[allow(dead_code)]
+fn assert_exhaustive_match(e: MonitorError) {
+    match e {
+        MonitorError::Unauthorized => {}
+        MonitorError::NotInitialized => {}
+        MonitorError::AlreadyInitialized => {}
+        MonitorError::BetCapExceeded => {}
+        MonitorError::PositionCapExceeded => {}
+        MonitorError::SubscriptionCapExceeded => {}
+        MonitorError::InvalidInput => {}
+        MonitorError::Overflow => {}
+        MonitorError::Underflow => {}
+    }
 }

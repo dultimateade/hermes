@@ -4,8 +4,17 @@ set -e
 # Strict error handling: exit on any error or undefined variable
 set -u
 
-# Default budget: 768 KiB = 768 * 1024 = 786432 bytes
-BUDGET=${WASM_SIZE_BUDGET:-786432}
+# Stellar's maximum contract WASM upload size is 64 KiB.
+NETWORK_WASM_SIZE_LIMIT=65536
+BUDGET=${WASM_SIZE_BUDGET:-$NETWORK_WASM_SIZE_LIMIT}
+if [[ ! "$BUDGET" =~ ^[0-9]+$ ]]; then
+  echo "Error: WASM_SIZE_BUDGET must be a non-negative integer: $BUDGET" >&2
+  exit 2
+fi
+if [ "$BUDGET" -gt "$NETWORK_WASM_SIZE_LIMIT" ]; then
+  echo "Warning: WASM_SIZE_BUDGET exceeds the network limit; enforcing $NETWORK_WASM_SIZE_LIMIT bytes."
+  BUDGET=$NETWORK_WASM_SIZE_LIMIT
+fi
 
 # Get the target contract name from Cargo.toml in the current directory
 # If no Cargo.toml is found, assume this is a workspace build

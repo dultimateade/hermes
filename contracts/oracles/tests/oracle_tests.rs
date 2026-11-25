@@ -2,15 +2,19 @@
 
 use soroban_sdk::{
     contract, contractimpl, Address, Env, String,
-    testutils::Address as _,
+    testutils::{Address as _, Ledger as _},
 };
-use oracles::{OraclesContract, OraclesContractClient, Error, OraclePriceData};
+use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient, Error, OraclePriceData};
 
 #[contract]
 pub struct MockOracle;
 
 #[contractimpl]
 impl MockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     pub fn get_price(_env: Env, _feed_id: String) -> i128 {
         12345
     }
@@ -32,6 +36,10 @@ pub struct MockOraclePriceOnly;
 
 #[contractimpl]
 impl MockOraclePriceOnly {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     pub fn get_price(_env: Env, _feed_id: String) -> i128 {
         54321
     }
@@ -45,6 +53,10 @@ pub struct MockOracleUnhealthy;
 
 #[contractimpl]
 impl MockOracleUnhealthy {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     pub fn get_price(_env: Env, _feed_id: String) -> i128 {
         0
     }
@@ -58,7 +70,41 @@ pub struct MockOracleFailing;
 
 #[contractimpl]
 impl MockOracleFailing {
-    // Empty implementation to cause dynamic invocations to fail/return None
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+}
+
+#[contract]
+pub struct MockOracleWithoutGetPrice;
+
+#[contractimpl]
+impl MockOracleWithoutGetPrice {
+    pub fn capabilities(_env: Env) -> u64 {
+        0
+    }
+}
+
+#[test]
+fn test_add_oracle_rejects_addresses_without_get_price_capability() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(OraclesContract, ());
+    let client = OraclesContractClient::new(&env, &contract_id);
+    let eoa = Address::generate(&env);
+    let unsupported_contract = env.register(MockOracleWithoutGetPrice, ());
+
+    assert_eq!(
+        client.try_add_oracle(&admin, &eoa),
+        Err(Ok(Error::OracleUnavailable))
+    );
+    assert_eq!(
+        client.try_add_oracle(&admin, &unsupported_contract),
+        Err(Ok(Error::OracleUnavailable))
+    );
+    assert!(client.list_oracles().is_empty());
 }
 
 #[test]
@@ -75,7 +121,7 @@ fn test_oracle_lifecycle_and_queries() {
 
     // Register a valid mock oracle
     let oracle_addr = env.register(MockOracle, ());
-    client.add_oracle(&admin, &oracle_addr);
+    client.add_oracle(&admin, &oracle_addr).unwrap();
 
     // Verify it is registered
     let list = client.list_oracles();
@@ -83,7 +129,7 @@ fn test_oracle_lifecycle_and_queries() {
     assert_eq!(list.get(0).unwrap(), oracle_addr);
 
     // Test duplicate registration (should be a no-op)
-    client.add_oracle(&admin, &oracle_addr);
+    client.add_oracle(&admin, &oracle_addr).unwrap();
     assert_eq!(client.list_oracles().len(), 1);
 
     // 2. Query price
@@ -99,11 +145,12 @@ fn test_oracle_lifecycle_and_queries() {
     assert_eq!(pdata.exponent, -8);
 
     // 4. Check health
-    assert!(client.is_oracle_healthy(&oracle_addr));
+    assert!(client.is_oracle_healthy(&oracle_addr, &feed));
+    client.check_oracle_health(&oracle_addr, &feed);
 
     // 5. Register Price-only oracle
     let price_only_addr = env.register(MockOraclePriceOnly, ());
-    client.add_oracle(&admin, &price_only_addr);
+    client.add_oracle(&admin, &price_only_addr).unwrap();
 
     // Verify list contains both
     let list = client.list_oracles();
@@ -119,18 +166,23 @@ fn test_oracle_lifecycle_and_queries() {
     assert_eq!(fallback_pdata.publish_time, env.ledger().timestamp());
     assert_eq!(fallback_pdata.confidence, None);
     assert_eq!(fallback_pdata.exponent, 0);
+    assert!(!client.is_oracle_healthy(&price_only_addr, &feed));
 
     // 6. Register Unhealthy oracle
     let unhealthy_addr = env.register(MockOracleUnhealthy, ());
     client.add_oracle(&admin, &unhealthy_addr);
-    assert!(!client.is_oracle_healthy(&unhealthy_addr));
+    assert!(!client.is_oracle_healthy(&unhealthy_addr, &feed));
+    assert_eq!(
+        client.try_check_oracle_health(&unhealthy_addr, &feed),
+        Err(Ok(Error::OracleUnavailable))
+    );
 
     // 7. Register Failing oracle
     let failing_addr = env.register(MockOracleFailing, ());
-    client.add_oracle(&admin, &failing_addr);
+    client.add_oracle(&admin, &failing_addr).unwrap();
 
     // Failing oracle is not healthy
-    assert!(!client.is_oracle_healthy(&failing_addr));
+    assert!(!client.is_oracle_healthy(&failing_addr, &feed));
 
     // Failing oracle get_price returns error
     let price_res = client.try_get_price(&failing_addr, &feed);
@@ -151,7 +203,11 @@ fn test_oracle_lifecycle_and_queries() {
         Err(Ok(Error::InvalidOracleConfig))
     );
     assert_eq!(
-        client.try_is_oracle_healthy(&unregistered_addr),
+        client.try_is_oracle_healthy(&unregistered_addr, &feed),
+        Err(Ok(Error::InvalidOracleConfig))
+    );
+    assert_eq!(
+        client.try_check_oracle_health(&unregistered_addr, &feed),
         Err(Ok(Error::InvalidOracleConfig))
     );
 
@@ -167,6 +223,60 @@ fn test_oracle_lifecycle_and_queries() {
 }
 
 #[test]
+fn test_get_price_data_rejects_stale_publication() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|ledger| ledger.timestamp = 7_200);
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(OraclesContract, ());
+    let client = OraclesContractClient::new(&env, &contract_id);
+    let oracle_addr = env.register(MockOracle, ());
+    client.add_oracle(&admin, &oracle_addr);
+
+    let feed = String::from_str(&env, "BTC/USD");
+    assert_eq!(
+        client.try_check_oracle_health(&oracle_addr, &feed),
+        Err(Ok(Error::OracleStale))
+    );
+    assert_eq!(
+        client.try_get_price_data(&oracle_addr, &feed),
+        Err(Ok(Error::OracleStale))
+    );
+    assert!(!client.is_oracle_healthy(&oracle_addr, &feed));
+}
+
+#[test]
+fn test_oracle_health_uses_configured_staleness_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_005);
+
+    let admin = Address::generate(&env);
+    let contract_id = env.register(OraclesContract, ());
+    let client = OraclesContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &5);
+
+    let oracle_addr = env.register(MockOracle, ());
+    client.add_oracle(&admin, &oracle_addr);
+    let feed = String::from_str(&env, "BTC/USD");
+    assert!(client.is_oracle_healthy(&oracle_addr, &feed));
+    assert_eq!(client.get_price_data(&oracle_addr, &feed).publish_time, 1_000);
+
+    env.ledger().with_mut(|ledger| ledger.timestamp = 1_006);
+    assert!(!client.is_oracle_healthy(&oracle_addr, &feed));
+    assert_eq!(
+        client.try_get_price_data(&oracle_addr, &feed),
+        Err(Ok(Error::OracleStale))
+    );
+
+    assert_eq!(
+        client.try_initialize(&admin, &10),
+        Err(Ok(Error::AlreadyInitialized))
+    );
+}
+
+#[test]
 #[should_panic]
 fn test_add_oracle_requires_auth() {
     let env = Env::default();
@@ -177,7 +287,7 @@ fn test_add_oracle_requires_auth() {
     let client = OraclesContractClient::new(&env, &contract_id);
     
     // This should panic due to missing authentication/authorization
-    client.add_oracle(&admin, &oracle);
+    client.add_oracle(&admin, &oracle).unwrap();
 }
 
 #[test]

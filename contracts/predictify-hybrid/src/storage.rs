@@ -19,10 +19,12 @@ pub const MARKETS_LIFETIME_THRESHOLD: u32 = 31 * LEDGERS_PER_DAY;
 pub const MARKETS_BUMP_AMOUNT: u32 = MARKET_TTL_LEDGERS;
 const EVENT_TTL_LEDGERS: u32 = 90 * LEDGERS_PER_DAY;
 const ARCHIVE_TTL_LEDGERS: u32 = 365 * LEDGERS_PER_DAY;
-/// TTL for consumed `place_bets` idempotency keys (≈ 7 days at 5 s/ledger).
-/// A key stored beyond this window is treated as expired; the same raw bytes
-/// can be reused in a fresh batch after expiry.
-pub const PLACE_BETS_IDEM_TTL_LEDGERS: u32 = 7 * LEDGERS_PER_DAY;
+/// Retention for consumed `place_bets` idempotency keys.
+///
+/// These keys protect a value-transferring operation and must outlive the
+/// short retry window. Keeping them for the same one-year horizon as market
+/// records prevents a delayed replay from becoming valid after seven days.
+pub const PLACE_BETS_IDEM_TTL_LEDGERS: u32 = MARKET_TTL_LEDGERS;
 
 /// Hard cap on entries kept in each per-market leaderboard heap.
 ///
@@ -80,14 +82,14 @@ pub(crate) fn bump_market_ttl(env: &Env, key: &impl IntoVal<Env, Val>) {
 /// 1. `effective_ttl = MIN(MARKET_TTL_LEDGERS, env.storage().max_ttl())`
 /// 2. The current ledger sequence plus `effective_ttl` must not overflow `u32`.
 /// # Errors
-/// Returns [`Error::InsufficientStorageRent`] if the sequence would overflow.
+/// Returns [`Error::InsufficientStorageRentBudget`] if the sequence would overflow.
 pub fn check_market_creation_rent(env: &Env) -> Result<(), Error> {
     let effective_ttl = MARKET_TTL_LEDGERS.min(env.storage().max_ttl());
     let current_seq = env.ledger().sequence();
 
-    if current_seq.checked_add(effective_ttl).is_none() {
-        return Err(Error::InsufficientStorageRentBudget);
-    }
+    current_seq
+        .checked_add(effective_ttl)
+        .ok_or(Error::InsufficientStorageRentBudget)?;
 
     Ok(())
 }
@@ -118,7 +120,7 @@ pub fn check_market_creation_rent(env: &Env) -> Result<(), Error> {
 /// # Errors
 ///
 /// Returns [`Error::InsufficientStorageRentBudget`] if the aggregate budget
-/// would overflow `u32`.
+/// would overflow `u32` or if approaching the u32::MAX boundary.
 pub fn check_market_creation_rent_budget(env: &Env) -> Result<(), Error> {
     let effective_ttl = MARKET_TTL_LEDGERS.min(env.storage().max_ttl());
 
@@ -126,8 +128,9 @@ pub fn check_market_creation_rent_budget(env: &Env) -> Result<(), Error> {
         .checked_mul(MARKET_CREATION_PERSISTENT_KEYS)
         .ok_or(Error::InsufficientStorageRentBudget)?;
 
-    env.ledger()
-        .sequence()
+    let current_seq = env.ledger().sequence();
+
+    current_seq
         .checked_add(required)
         .ok_or(Error::InsufficientStorageRentBudget)?;
 
@@ -210,6 +213,10 @@ pub enum DataKey {
     /// Per-market cool-off override in seconds (u64) for a specific `market_id`.
     /// Takes precedence over `CoolOffPeriod` when present.
     PerMarketCoolOff(Symbol),
+    /// Global maximum number of outcomes a market may declare.
+    /// Value: `u32`. Admins can raise or lower it without a contract upgrade;
+    /// when unset, [`crate::markets::DEFAULT_MAX_OUTCOMES_PER_MARKET`] applies.
+    MaxOutcomesPerMarket,
 }
 
 /// Storage format version for migration tracking

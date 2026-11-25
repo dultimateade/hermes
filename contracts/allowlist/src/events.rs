@@ -11,10 +11,11 @@
 //! | `alist_created`  | A new allowlist is created  |
 //! | `alist_addr_add` | An address is added         |
 //! | `alist_addr_rem` | An address is removed       |
-//! | `alist_cleared`  | All addresses are removed   |
+//! | `alist_cleared`  | Authoritative bulk removal of all addresses |
 //! | `alist_deleted`  | An allowlist is deleted     |
 //! | `alist_owner_xf` | Ownership is transferred    |
 //! | `alist_init`     | Contract is initialized     |
+//! | `alist_batch_add` | Addresses are batch-added |
 
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
@@ -51,6 +52,21 @@ pub fn emit_allowlist_address_added(
     env.events().publish(topics, env.ledger().timestamp());
 }
 
+/// Emit one event containing the full set of addresses added by a batch call.
+pub fn emit_allowlist_addresses_added(
+    env: &Env,
+    admin: &Address,
+    allowlist_id: &Symbol,
+    addresses: &Vec<Address>,
+) {
+    let topics = (
+        Symbol::new(env, "alist_batch_add"),
+        admin,
+        allowlist_id,
+    );
+    env.events().publish(topics, addresses);
+}
+
 /// Emit an `AllowlistAddressRemoved` event.
 ///
 /// Published when an address is removed from an allowlist via
@@ -78,6 +94,10 @@ pub fn emit_allowlist_address_removed(
 ///
 /// The `removed_count` is the number of addresses that were removed during
 /// the clear operation.
+///
+/// This event is authoritative for indexers: it removes all addresses from
+/// the allowlist at the event timestamp. Individual `alist_addr_rem` events
+/// are not emitted for a clear operation.
 pub fn emit_allowlist_cleared(
     env: &Env,
     admin: &Address,

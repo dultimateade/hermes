@@ -18,6 +18,9 @@
 //!   registered admin address.
 //! - Read-only entrypoints (`is_allowed`, `get_allowlist`, `list_allowlists`,
 //!   `get_admin`, `version`) do not require authentication.
+//! - Every entrypoint extends the instance storage TTL, and admin and registry state
+//!   are maintained in persistent storage with explicit TTL management, preventing
+//!   admin lockouts if instance TTL expires.
 //!
 //! # Event Topics
 //!
@@ -48,8 +51,10 @@ use soroban_sdk::{
 
 /// Minimum remaining ledgers before an allowlist entry is bumped on read.
 const ALLOWLIST_TTL_THRESHOLD: u32 = 100_000;
-/// Extended TTL ledgers for allowlist entries.
-const ALLOWLIST_TTL_TO: u32 = 518_400;
+/// Minimum remaining ledgers before the contract instance TTL is bumped.
+const INSTANCE_TTL_THRESHOLD: u32 = 100_000;
+/// Target TTL ledgers for contract persistent entries and instance storage.
+const CONTRACT_TTL_LEDGERS: u32 = 518_400;
 
 // ---------------------------------------------------------------------------
 // Storage keys
@@ -98,17 +103,34 @@ impl AllowlistContract {
     /// # Errors
     /// - [`AllowlistError::AlreadyInitialized`] if already initialized.
     pub fn initialize(env: Env, admin: Address) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
 
-        if env.storage().instance().has(&DataKey::Initialized) {
+        if Self::is_initialized(&env) {
             return Err(AllowlistError::AlreadyInitialized);
         }
 
-        env.storage().instance().set(&DataKey::Initialized, &true);
-        env.storage().instance().set(&DataKey::Admin, &admin);
+        // Persist admin, initialization status, and registry in persistent storage with TTL management
+        env.storage().persistent().set(&DataKey::Initialized, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Initialized, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+
+        env.storage().persistent().set(&DataKey::Admin, &admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+
         env.storage()
             .persistent()
             .set(&DataKey::AllowlistRegistry, &Vec::<Symbol>::new(&env));
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllowlistRegistry, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+
+        // Keep instance storage synchronized for backward compatibility
+        env.storage().instance().set(&DataKey::Initialized, &true);
+        env.storage().instance().set(&DataKey::Admin, &admin);
 
         events::emit_allowlist_initialized(&env, &admin);
 
@@ -136,6 +158,7 @@ impl AllowlistContract {
         admin: Address,
         allowlist_id: Symbol,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -160,6 +183,9 @@ impl AllowlistContract {
             env.storage()
                 .persistent()
                 .set(&DataKey::AllowlistRegistry, &registry);
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::AllowlistRegistry, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
         }
 
         events::emit_allowlist_created(&env, &admin, &allowlist_id);
@@ -186,6 +212,7 @@ impl AllowlistContract {
         allowlist_id: Symbol,
         address: Address,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -223,6 +250,7 @@ impl AllowlistContract {
         allowlist_id: Symbol,
         address: Address,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -266,20 +294,25 @@ impl AllowlistContract {
         allowlist_id: Symbol,
         addresses: Vec<Address>,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
 
         let mut addrs = Self::load_allowlist(&env, &allowlist_id)?;
+        let mut added = Vec::<Address>::new(&env);
 
         for addr in addresses.iter() {
             if !addrs.contains(&addr) {
                 addrs.push_back(addr.clone());
-                events::emit_allowlist_address_added(&env, &admin, &allowlist_id, &addr);
+                added.push_back(addr);
             }
         }
 
         Self::save_allowlist(&env, &allowlist_id, &addrs);
+        if added.len() > 0 {
+            events::emit_allowlist_addresses_added(&env, &admin, &allowlist_id, &added);
+        }
 
         Ok(())
     }
@@ -304,6 +337,7 @@ impl AllowlistContract {
         allowlist_id: Symbol,
         addresses: Vec<Address>,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -328,6 +362,9 @@ impl AllowlistContract {
     /// Remove all addresses from an allowlist.
     ///
     /// Emits an `alist_cleared` event with the count of removed addresses.
+    /// This event is authoritative: indexers must treat it as removing every
+    /// address from the allowlist at the event timestamp. Individual
+    /// `alist_addr_rem` events are not emitted for this operation.
     ///
     /// # Authorization
     /// The `admin` must authenticate via `require_auth()` and be the
@@ -342,6 +379,7 @@ impl AllowlistContract {
         admin: Address,
         allowlist_id: Symbol,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -377,6 +415,7 @@ impl AllowlistContract {
         admin: Address,
         allowlist_id: Symbol,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &admin)?;
@@ -405,6 +444,9 @@ impl AllowlistContract {
         env.storage()
             .persistent()
             .set(&DataKey::AllowlistRegistry, &filtered);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::AllowlistRegistry, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
 
         events::emit_allowlist_deleted(&env, &admin, &allowlist_id, count);
 
@@ -428,6 +470,7 @@ impl AllowlistContract {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), AllowlistError> {
+        Self::bump_instance_ttl(&env);
         current_admin.require_auth();
         Self::require_initialized(&env)?;
         Self::require_admin(&env, &current_admin)?;
@@ -435,6 +478,13 @@ impl AllowlistContract {
         if new_admin == current_admin {
             return Err(AllowlistError::InvalidInput);
         }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::Admin, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
 
         env.storage()
             .instance()
@@ -450,7 +500,8 @@ impl AllowlistContract {
     // =======================================================================
 
     /// Return the contract's numeric version.
-    pub fn version(_env: Env) -> u32 {
+    pub fn version(env: Env) -> u32 {
+        Self::bump_instance_ttl(&env);
         1
     }
 
@@ -459,21 +510,62 @@ impl AllowlistContract {
     /// # Errors
     /// - [`AllowlistError::NotInitialized`] if contract not initialized.
     pub fn get_admin(env: Env) -> Result<Address, AllowlistError> {
+        Self::bump_instance_ttl(&env);
         Self::require_initialized(&env)?;
-        env.storage()
-            .instance()
-            .get::<DataKey, Address>(&DataKey::Admin)
-            .ok_or(AllowlistError::NotInitialized)
+        Self::get_admin_internal(&env).ok_or(AllowlistError::NotInitialized)
     }
 
     /// Check whether an `address` is present in the allowlist identified by
     /// `allowlist_id`.
     ///
     /// # Errors
+    /// - [`AllowlistError::AllowlistExpired`] if the allowlist's storage entry
+    ///   expired while its ID remains registered.
     /// - [`AllowlistError::AllowlistNotFound`] if the allowlist does not exist.
     pub fn is_allowed(env: Env, allowlist_id: Symbol, address: Address) -> Result<bool, AllowlistError> {
+        Self::bump_instance_ttl(&env);
+        let key = allowlist_storage_key(&env, &allowlist_id);
+        if let Some(addrs) = env.storage().persistent().get::<_, Vec<Address>>(&key) {
+            return Ok(addrs.contains(&address));
+        }
+
+        let is_registered = match env
+            .storage()
+            .persistent()
+            .get::<_, Vec<Symbol>>(&DataKey::AllowlistRegistry)
+        {
+            Some(allowlists) => allowlists.contains(&allowlist_id),
+            None => false,
+        };
+        if is_registered {
+            Err(AllowlistError::AllowlistExpired)
+        } else {
+            Err(AllowlistError::AllowlistNotFound)
+        }
+    }
+
+    /// Batch check whether each `address` in `addresses` is present in the
+    /// allowlist identified by `allowlist_id`.
+    ///
+    /// This endpoint reduces ledger reads by performing a single storage read
+    /// for the allowlist, then checking all addresses against the in-memory
+    /// vector. Significantly halves the read cost compared to calling
+    /// `is_allowed` once per address.
+    ///
+    /// # Errors
+    /// - [`AllowlistError::AllowlistNotFound`] if the allowlist does not exist.
+    pub fn batch_is_allowed(
+        env: Env,
+        allowlist_id: Symbol,
+        addresses: Vec<Address>,
+    ) -> Result<Vec<(Address, bool)>, AllowlistError> {
+        Self::bump_instance_ttl(&env);
         let addrs = Self::load_allowlist(&env, &allowlist_id)?;
-        Ok(addrs.contains(&address))
+        let mut results: Vec<(Address, bool)> = Vec::new(&env);
+        for addr in addresses.iter() {
+            results.push_back((addr.clone(), addrs.contains(&addr)));
+        }
+        Ok(results)
     }
 
     /// Return all addresses in the allowlist identified by `allowlist_id`.
@@ -481,11 +573,18 @@ impl AllowlistContract {
     /// # Errors
     /// - [`AllowlistError::AllowlistNotFound`] if the allowlist does not exist.
     pub fn get_allowlist(env: Env, allowlist_id: Symbol) -> Result<Vec<Address>, AllowlistError> {
+        Self::bump_instance_ttl(&env);
         Self::load_allowlist(&env, &allowlist_id)
     }
 
     /// Return all registered allowlist IDs.
     pub fn list_allowlists(env: Env) -> Vec<Symbol> {
+        Self::bump_instance_ttl(&env);
+        if env.storage().persistent().has(&DataKey::AllowlistRegistry) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::AllowlistRegistry, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+        }
         env.storage()
             .persistent()
             .get(&DataKey::AllowlistRegistry)
@@ -496,9 +595,41 @@ impl AllowlistContract {
     // Internal helpers
     // =======================================================================
 
+    /// Extend the contract instance TTL so instance-backed admin state remains
+    /// available after periods of inactivity.
+    fn bump_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+    }
+
+    /// Check if the contract is initialized, extending TTL if stored in persistent storage.
+    fn is_initialized(env: &Env) -> bool {
+        if env.storage().persistent().has(&DataKey::Initialized) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Initialized, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+            true
+        } else {
+            env.storage().instance().has(&DataKey::Initialized)
+        }
+    }
+
+    /// Read admin address, checking persistent storage first and falling back to instance storage.
+    fn get_admin_internal(env: &Env) -> Option<Address> {
+        if env.storage().persistent().has(&DataKey::Admin) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&DataKey::Admin, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
+            env.storage().persistent().get(&DataKey::Admin)
+        } else {
+            env.storage().instance().get(&DataKey::Admin)
+        }
+    }
+
     /// Assert the contract is initialized.
     fn require_initialized(env: &Env) -> Result<(), AllowlistError> {
-        if !env.storage().instance().has(&DataKey::Initialized) {
+        if !Self::is_initialized(env) {
             return Err(AllowlistError::NotInitialized);
         }
         Ok(())
@@ -506,11 +637,7 @@ impl AllowlistContract {
 
     /// Assert that `caller` is the registered admin.
     fn require_admin(env: &Env, caller: &Address) -> Result<(), AllowlistError> {
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(AllowlistError::NotInitialized)?;
+        let stored: Address = Self::get_admin_internal(env).ok_or(AllowlistError::NotInitialized)?;
         if caller != &stored {
             return Err(AllowlistError::Unauthorized);
         }
@@ -536,6 +663,6 @@ impl AllowlistContract {
         // Extend TTL so the allowlist record does not expire prematurely.
         env.storage()
             .persistent()
-            .extend_ttl(&key, ALLOWLIST_TTL_THRESHOLD, ALLOWLIST_TTL_TO);
+            .extend_ttl(&key, ALLOWLIST_TTL_THRESHOLD, CONTRACT_TTL_LEDGERS);
     }
 }

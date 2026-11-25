@@ -152,7 +152,12 @@ fn create_disputable_market(
     let market_id = Symbol::new(env, name);
 
     let now = env.ledger().timestamp();
-    let end_time = now.saturating_sub(3_600); // 1 hour in the past
+    let total_staked = match market_idx % 4 {
+        0 => 0i128,              // Zero-staked market (Issue #029 edge case)
+        1 => 100i128,            // Small stake
+        2 => 10_000_000i128,     // Moderate stake
+        _ => 100_000_000_000i128 // Large market (> large_market_threshold)
+    };
 
     let market = Market {
         admin: admin.clone(),
@@ -170,7 +175,7 @@ fn create_disputable_market(
         resolution_timeout: 86_400u64,
         oracle_result: Some(SorobanString::from_str(env, "yes")),
         votes: soroban_sdk::Map::new(env),
-        total_staked: 0,
+        total_staked,
         dispute_stakes: soroban_sdk::Map::new(env),
         stakes: soroban_sdk::Map::new(env),
         claimed: soroban_sdk::Map::new(env),

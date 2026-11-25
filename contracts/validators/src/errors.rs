@@ -40,4 +40,6 @@ pub enum ValidatorError {
     InvalidNewOwner = 10,
     /// A configuration parameter is out of the accepted range.
     InvalidConfig = 11,
+    /// The validator cannot deregister while participating in an active resolution round.
+    ValidatorInActiveRound = 12,
 }

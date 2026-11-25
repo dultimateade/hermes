@@ -1,0 +1,17 @@
+[package]
+name = "fees-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata.cargo-fuzz]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+fees = { path = ".." }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+
+[[bin]]
+name = "main"
+path = "targets/main.rs"

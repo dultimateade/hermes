@@ -490,6 +490,81 @@ fn stake_cap_at_boundary_accepted() {
 }
 
 // ---------------------------------------------------------------------------
+// Zero-staked market dispute threshold & processing (Issue #029)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_zero_staked_market_dispute_processing() {
+    let (env, contract_id, _admin, users) = setup_env();
+    let user = users[0].clone();
+
+    let now = 1_000_000u64;
+    set_ledger_time(&env, now);
+
+    let market_id = Symbol::new(&env, "ZERO_STK");
+    let market = Market {
+        admin: _admin.clone(),
+        question: SorobanString::from_str(&env, "Will BTC exceed 50k?"),
+        outcomes: soroban_sdk::vec![
+            &env,
+            SorobanString::from_str(&env, "yes"),
+            SorobanString::from_str(&env, "no"),
+        ],
+        end_time: now.saturating_sub(3_600),
+        oracle_config: OracleConfig::new(
+            OracleProvider::reflector(),
+            Address::from_str(
+                &env,
+                "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+            ),
+            SorobanString::from_str(&env, "BTC/USD"),
+            50_000_00i128,
+            SorobanString::from_str(&env, "gt"),
+        ),
+        metadata_commitment: soroban_sdk::BytesN::from_array(&env, &[0u8; 32]),
+        has_fallback: false,
+        fallback_oracle_config: OracleConfig::none_sentinel(&env),
+        resolution_timeout: 86_400u64,
+        oracle_result: Some(SorobanString::from_str(&env, "yes")),
+        votes: soroban_sdk::Map::new(&env),
+        total_staked: 0,
+        dispute_stakes: soroban_sdk::Map::new(&env),
+        stakes: soroban_sdk::Map::new(&env),
+        claimed: soroban_sdk::Map::new(&env),
+        winning_outcomes: None,
+        fee_collected: false,
+        state: MarketState::Active,
+        total_extension_days: 0,
+        max_extension_days: 30,
+        extension_history: soroban_sdk::Vec::new(&env),
+        category: None,
+        tags: soroban_sdk::Vec::new(&env),
+        min_pool_size: None,
+        bet_deadline: 0,
+        dispute_window_seconds: DISPUTE_PERIOD_SECS,
+        winnings_swept: false,
+        timelock_config: predictify_hybrid::timelock::MarketTimelockConfig::default(),
+        dispute_stake_floor: None,
+        max_participants: None,
+        min_bet_amount: None,
+    };
+
+    env.as_contract(&contract_id, || {
+        MarketStateManager::update_market(&env, &market_id, &market);
+    });
+
+    let result = env.as_contract(&contract_id, || {
+        DisputeManager::process_dispute(&env, user, market_id, MIN_DISPUTE_STAKE, None)
+    });
+
+    assert!(
+        result.is_ok(),
+        "dispute on zero-staked market must succeed without division-by-zero or calculation error: {:?}",
+        result
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Error code stability (regression guard)
 // ---------------------------------------------------------------------------
 

@@ -8,7 +8,7 @@
 //! - **Bet Placement**: Users can place bets on active markets
 //! - **Fund Locking**: User funds are locked in the contract until resolution
 //! - **Bet Tracking**: Tracks bet amount and selected outcome per user
-//! - **Double Betting Prevention**: Prevents users from betting twice on the same market
+//! - **Bet Replacement**: Replaces an existing active bet while keeping pool totals balanced
 //! - **Validation**: Comprehensive validation for market state, outcomes, and balances
 //! - **Event Emission**: Emits bet placement events for transparency
 //!
@@ -22,9 +22,9 @@
 use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, Map, String, Symbol, Vec};
 
 use crate::err::Error;
-use crate::reentrancy_guard::{ReentrancyGuard, GuardError as ReentrancyError};
 use crate::events::EventEmitter;
 use crate::markets::{MarketStateManager, MarketUtils, MarketValidator};
+use crate::reentrancy_guard::{GuardError as ReentrancyError, ReentrancyGuard};
 use crate::types::{Bet, BetLimits, BetStats, BetStatus, Market, MarketState};
 // use crate::validation;
 
@@ -64,6 +64,22 @@ const GLOBAL_BET_LIMITS_KEY: &str = "bet_limits_global";
 const PER_EVENT_BET_LIMITS_KEY: &str = "bet_limits_evt";
 /// Storage key for per-market max single-bet cap map (Symbol -> i128).
 const PER_MARKET_MAX_BET_CAP_KEY: &str = "max_bet_cap_mkt";
+
+/// Storage key for the global bet-cancellation window (seconds).
+const BET_CANCEL_WINDOW_KEY: &str = "bet_cncl_win";
+
+/// Default bet-cancellation window in seconds (5 minutes).
+///
+/// A bettor may cancel a still-open bet within this many seconds of placing
+/// it. The window is deliberately short so that accidental placements can be
+/// undone without materially affecting market liquidity.
+pub const DEFAULT_BET_CANCEL_WINDOW_SECONDS: u64 = 300;
+
+/// Absolute upper bound for the configurable cancellation window (24 hours).
+///
+/// Guards against an admin configuring a window so wide that it effectively
+/// disables the "short window" guarantee.
+pub const MAX_BET_CANCEL_WINDOW_SECONDS: u64 = 86_400;
 
 // ===== STORAGE KEY TYPES =====
 
@@ -175,6 +191,49 @@ pub fn set_event_bet_limits(
     Ok(())
 }
 
+/// Retrieve the effective global bet-cancellation window in seconds.
+///
+/// The window bounds how long (measured from `Bet::timestamp`) a bettor may
+/// still cancel a bet. It is admin-configurable through
+/// `set_bet_cancel_window`; when unset it defaults to
+/// `DEFAULT_BET_CANCEL_WINDOW_SECONDS`.
+///
+/// # Parameters
+///
+/// - `env` – Soroban environment
+///
+/// # Returns
+///
+/// The active cancellation window in seconds.
+pub fn get_bet_cancel_window(env: &Env) -> u64 {
+    let key = Symbol::new(env, BET_CANCEL_WINDOW_KEY);
+    env.storage()
+        .persistent()
+        .get::<Symbol, u64>(&key)
+        .unwrap_or(DEFAULT_BET_CANCEL_WINDOW_SECONDS)
+}
+
+/// Persist the global bet-cancellation window (admin authorization is enforced
+/// at the contract entrypoint layer).
+///
+/// # Parameters
+///
+/// - `env`     – Soroban environment
+/// - `seconds` – New window length in seconds
+///
+/// # Errors
+///
+/// Returns `Error::InvalidInput` when `seconds` is zero or exceeds
+/// `MAX_BET_CANCEL_WINDOW_SECONDS`.
+pub fn set_bet_cancel_window(env: &Env, seconds: u64) -> Result<(), Error> {
+    if seconds == 0 || seconds > MAX_BET_CANCEL_WINDOW_SECONDS {
+        return Err(Error::InvalidInput);
+    }
+    let key = Symbol::new(env, BET_CANCEL_WINDOW_KEY);
+    env.storage().persistent().set(&key, &seconds);
+    Ok(())
+}
+
 /// Set a per-market max single-bet cap (admin only).
 ///
 /// Once set, any individual bet whose `amount` exceeds `cap` will be rejected
@@ -262,11 +321,7 @@ pub fn get_market_max_bet_cap(env: &Env, market_id: &Symbol) -> Option<i128> {
 ///
 /// - [`Error::MarketNotFound`] if `market_id` does not correspond to an existing market
 /// - [`Error::InvalidInput`] if `min_amount` is zero, negative, or exceeds [`MAX_BET_AMOUNT`]
-pub fn set_market_min_bet(
-    env: &Env,
-    market_id: &Symbol,
-    min_amount: i128,
-) -> Result<(), Error> {
+pub fn set_market_min_bet(env: &Env, market_id: &Symbol, min_amount: i128) -> Result<(), Error> {
     if min_amount <= 0 || min_amount > MAX_BET_AMOUNT {
         return Err(Error::InvalidInput);
     }
@@ -383,7 +438,8 @@ impl BetManager {
     /// Place a bet on a market outcome with fund locking.
     ///
     /// This function processes a user's bet on a prediction market, including
-    /// validation, fund locking, and bet storage.
+    /// validation, escrow adjustment, and bet storage. When replacing an active
+    /// bet, `amount` is the new total stake, not an additional stake.
     ///
     /// # Parameters
     ///
@@ -391,7 +447,7 @@ impl BetManager {
     /// - `user` - Address of the user placing the bet
     /// - `market_id` - Symbol identifying the market
     /// - `outcome` - The outcome the user is betting on
-    /// - `amount` - The amount to lock for this bet
+    /// - `amount` - The total amount to stake on this bet
     /// - `max_fee_bps` - Optional maximum platform fee percentage in basis points (slippage guard)
     ///
     /// # Returns
@@ -404,7 +460,7 @@ impl BetManager {
     /// - `Error::MarketNotFound` - Market does not exist
     /// - `Error::MarketClosed` - Market has ended or is not active
     /// - `Error::MarketResolved` - Market has already been resolved
-    /// - `Error::AlreadyBet` - User has already placed a bet on this market
+    /// - `Error::AlreadyBet` - User already has a non-active bet on this market
     /// - `Error::InsufficientStake` - Bet amount below minimum
     /// - `Error::InvalidOutcome` - Selected outcome not valid for this market
     /// - `Error::InsufficientBalance` - User doesn't have enough funds
@@ -414,9 +470,9 @@ impl BetManager {
     ///
     /// - Requires user authentication via `require_auth()`
     /// - Validates market state before accepting bet
-    /// - Validates user has not already bet on this market
+    /// - Replaces any active bet and adjusts its pool contribution and escrow
     /// - Validates user has sufficient balance
-    /// - Locks funds atomically with bet creation
+    /// - Adjusts escrow atomically with bet creation
     /// - Fee slippage guard prevents unexpected fee increases
     ///
     /// # Example
@@ -486,19 +542,46 @@ impl BetManager {
         // Enforce fee slippage guard: reject if the effective platform fee exceeds caller's max
         BetValidator::validate_fee_slippage(env, max_fee_bps)?;
 
-        // Check if user has already bet on this market
-        if let Some(existing_bet) = Self::get_bet(env, &market_id, &user) {
-            if existing_bet.status != crate::types::BetStatus::Cancelled {
-                return Err(Error::AlreadyBet);
+        // Active bets may be replaced. Cancelled bets were already removed from
+        // the pool and refunded, while resolved bets cannot be replaced.
+        let previous_bet = match Self::get_bet(env, &market_id, &user) {
+            Some(existing_bet) if existing_bet.status == crate::types::BetStatus::Active => {
+                Some(existing_bet)
             }
-        }
+            Some(existing_bet) if existing_bet.status == crate::types::BetStatus::Cancelled => None,
+            Some(_) => return Err(Error::AlreadyBet),
+            None => None,
+        };
 
         // ===== PER-USER MAX BET CAP CHECK (BEFORE funds are locked) =====
         // Load current user stake and validate it won't exceed the cap
         BetValidator::validate_user_stake_under_cap(env, &market_id, &user, amount)?;
 
-        // Lock funds (transfer from user to contract)
-        BetUtils::lock_funds(env, &user, amount)?;
+        if let Some(existing_bet) = &previous_bet {
+            // Remove the previous stake before recording its replacement.
+            Self::update_market_bet_stats_on_cancel(
+                env,
+                &market_id,
+                &existing_bet.outcome,
+                existing_bet.amount,
+            )?;
+            market.total_staked = market.total_staked.saturating_sub(existing_bet.amount);
+
+            // Transfer only the difference so the user's net locked balance
+            // matches the replacement amount.
+            if amount > existing_bet.amount {
+                BetUtils::lock_funds(env, &user, amount - existing_bet.amount)?;
+            } else if existing_bet.amount > amount {
+                BetUtils::unlock_funds(env, &user, existing_bet.amount - amount)?;
+            }
+        } else {
+            // Lock funds (transfer from user to contract)
+            BetUtils::lock_funds(env, &user, amount)?;
+        }
+
+        // Token transfers are external calls; do not commit against a market
+        // snapshot that may have been resolved during the transfer.
+        market = Self::load_market_for_bet_commit(env, &market_id, amount)?;
 
         // Create bet
         let bet = Bet::new(
@@ -538,8 +621,6 @@ impl BetManager {
         Self::update_market_bet_stats(env, &market_id, &outcome, amount)?;
 
         // Update market's total staked (for payout pool calculation)
-        market.total_staked += amount;
-
         // Also update votes and stakes for backward compatibility with payout distribution
         // This allows distribute_payouts to work with both bets and votes
         market.votes.set(user.clone(), outcome.clone());
@@ -547,12 +628,13 @@ impl BetManager {
 
         MarketStateManager::update_market(env, &market_id, &market);
 
-        // Emit bet placed event
-        EventEmitter::emit_bet_placed(env, &market_id, &user, &outcome, amount);
+        // Replacing a bet writes MarketBetsKey once to remove the prior stake.
+        let write_count = if previous_bet.is_some() { 6 } else { 5 };
+        crate::gas::BetSnapshotManager::record(env, _cpu_before, write_count, &market_id);
 
-        // Record resource snapshot for regression baseline.
-        // write_count: BetKey + BetRegistryKey + MarketBetsKey + UserStake + Market = 5 writes
-        crate::gas::BetSnapshotManager::record(env, _cpu_before, 5, &market_id);
+        // Publish only after every fallible operation has completed. This
+        // keeps a failed call from exposing an intermediate bet event.
+        EventEmitter::emit_bet_placed(env, &market_id, &user, &outcome, amount);
 
         Ok(bet)
     }
@@ -569,9 +651,9 @@ impl BetManager {
     /// - `bets` - Vector of tuples (market_id, outcome, amount)
     /// - `max_fee_bps` - Optional maximum platform fee percentage in basis points (slippage guard)
     /// - `idempotency_key` - Caller-supplied 32-byte token that makes this batch unique.
-    ///   Consumed on the first successful call; reuse within the 7-day TTL window returns
+    ///   Consumed on the first successful call; reuse within the one-year retention window returns
     ///   `Error::IdempotentBatchAlreadyApplied`.  The TTL is defined by
-    ///   `crate::storage::PLACE_BETS_IDEM_TTL_LEDGERS` (≈ 7 days at 5 s/ledger).
+    ///   `crate::storage::PLACE_BETS_IDEM_TTL_LEDGERS` (≈ 365 days at 5 s/ledger).
     ///
     /// # Returns
     ///
@@ -580,8 +662,10 @@ impl BetManager {
     ///
     /// # Atomicity
     ///
-    /// All bets are validated before any funds are locked. If any bet fails,
-    /// the entire transaction reverts with no state changes.
+    /// Every entry is fully validated (market state, outcome, limits, duplicate
+    /// markets, existing bets, per-user cap, overflow) before any storage write
+    /// or token transfer. If entry #3 of 5 fails, entries #1 and #2 are never
+    /// written and the call returns with no state change.
     ///
     /// # Errors
     ///
@@ -590,7 +674,9 @@ impl BetManager {
     /// - `Error::IdempotentBatchAlreadyApplied` - This idempotency key has already been consumed
     /// - `Error::MarketNotFound` - Any market does not exist
     /// - `Error::MarketClosed` - Any market has ended or is not active
-    /// - `Error::AlreadyBet` - User has already bet on any market
+    /// - `Error::AlreadyBet` - User has already bet on any market, or the batch
+    ///   lists the same market more than once
+    /// - `Error::MaxBetCapExceeded` - Any bet would push the user's stake over the cap
     /// - `Error::InsufficientStake` - Any bet amount below minimum
     /// - `Error::InvalidOutcome` - Any outcome not valid for its market
     /// - `Error::InsufficientBalance` - User doesn't have enough total funds
@@ -607,9 +693,27 @@ impl BetManager {
         user.require_auth();
 
         // --- Idempotency guard: reject replayed batches ---
-        let idem_key = crate::storage::DataKey::PlaceBetsIdem(user.clone(), idempotency_key.clone());
+        let idem_key =
+            crate::storage::DataKey::PlaceBetsIdem(user.clone(), idempotency_key.clone());
         if env.storage().persistent().has(&idem_key) {
             return Err(Error::IdempotentBatchAlreadyApplied);
+        }
+
+        // =====================================================================
+        // Phase 1: Validate the ENTIRE batch. No storage writes, no transfers.
+        //
+        // Every check that can reject a bet runs here, for every entry, before
+        // anything is committed. If entry #3 of 5 fails, entries #1 and #2
+        // have not touched storage and the call returns with no state change.
+        // =====================================================================
+
+        // Validate batch size
+        if bets.is_empty() {
+            return Err(Error::BatchEmpty);
+        }
+
+        if bets.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchSizeExceeded);
         }
 
         // Slippage check: verify live fee is not above the maximum acceptable threshold
@@ -621,28 +725,24 @@ impl BetManager {
             }
         }
 
-        // Validate batch size
-        if bets.is_empty() {
-            return Err(Error::BatchEmpty);
-        }
-
-        if bets.len() > MAX_BATCH_SIZE {
-            return Err(Error::BatchSizeExceeded);
-        }
-
-        // Phase 1: Validate all bets and collect data
         // Enforce fee slippage guard once for the batch
         BetValidator::validate_fee_slippage(env, max_fee_bps)?;
 
-        let mut markets = soroban_sdk::Vec::new(env);
+        // Pre-validate arithmetic before locking funds; commit reloads each
+        // market afterward to preserve any state changes during the transfer.
+        let mut seen_markets: soroban_sdk::Vec<Symbol> = soroban_sdk::Vec::new(env);
         let mut total_amount: i128 = 0;
 
         for bet_data in bets.iter() {
             let (market_id, outcome, amount) = bet_data;
 
-            // Enforce global per-ledger bet cap for each bet in the batch
-            let rate_limiter = crate::rate_limiter::RateLimiter::new(env.clone());
-            rate_limiter.rate_limit_global_bets_per_ledger()?;
+            // A user may hold only one bet per market. Two entries for the same
+            // market would pass the storage-based AlreadyBet check below (neither
+            // is stored yet) and the second would silently overwrite the first.
+            if seen_markets.contains(&market_id) {
+                return Err(Error::AlreadyBet);
+            }
+            seen_markets.push_back(market_id.clone());
 
             // Get and validate market
             let market = MarketStateManager::get_market(env, &market_id)?;
@@ -667,24 +767,50 @@ impl BetManager {
                 }
             }
 
+            // Per-user max bet cap (same check as single `place_bet`). Safe to
+            // evaluate against stored stake because market ids are unique within
+            // the batch, so no earlier entry contributes to this market's stake.
+            BetValidator::validate_user_stake_under_cap(env, &market_id, &user, amount)?;
+
+            // Pre-compute the market's new total so overflow is caught now,
+            // not halfway through the commit loop.
+            let _updated_total_staked = market
+                .total_staked
+                .checked_add(amount)
+                .ok_or(Error::InvalidInput)?;
+
             // Accumulate total amount
             total_amount = total_amount
                 .checked_add(amount)
                 .ok_or(Error::InvalidInput)?;
-
-            // Store market for later use
-            markets.push_back(market);
         }
 
+        // Enforce the global per-ledger bet cap for each bet in the batch. The
+        // limiter records a counter as it checks, so it runs only after every
+        // entry has validated; a rejection here still aborts the invocation,
+        // which rolls back the counter increments.
+        let rate_limiter = crate::rate_limiter::RateLimiter::new(env.clone());
+        for _ in 0..bets.len() {
+            rate_limiter.rate_limit_global_bets_per_ledger()?;
+        }
+
+        // =====================================================================
         // Phase 2: Lock total funds once (more efficient than per-bet transfers)
+        // =====================================================================
         BetUtils::lock_funds(env, &user, total_amount)?;
 
-        // Phase 3: Create and store all bets
+        // =====================================================================
+        // Phase 3: Commit all bets. Every entry has already been validated.
+        // Defer event publication until the complete batch has committed so
+        // indexers never observe progress from a batch that later fails.
+        // =====================================================================
+        let mut pending_bet_events: soroban_sdk::Vec<(Symbol, String, i128)> =
+            soroban_sdk::Vec::new(env);
         let mut placed_bets = soroban_sdk::Vec::new(env);
 
-        for (i, bet_data) in bets.iter().enumerate() {
+        for bet_data in bets.iter() {
             let (market_id, outcome, amount) = bet_data;
-            let mut market = markets.get(i as u32).unwrap();
+            let mut market = Self::load_market_for_bet_commit(env, &market_id, amount)?;
 
             // Create bet
             let bet = Bet::new(
@@ -698,40 +824,54 @@ impl BetManager {
             // Store bet
             BetStorage::store_bet(env, &bet)?;
 
+            // Update user stake for per-user max bet cap tracking
+            BetValidator::update_user_stake(env, &market_id, &user, amount)?;
+
+            // Per-market leaderboard update (errors ignored, as in `place_bet`)
+            {
+                let cumulative_stake = BetValidator::get_user_stake(env, &market_id, &user);
+                let timestamp = env.ledger().timestamp();
+                let _ = crate::market_analytics::MarketLeaderboard::upsert(
+                    env,
+                    &market_id,
+                    &user,
+                    cumulative_stake,
+                    timestamp,
+                    crate::storage::MAX_MARKET_LEADERBOARD_CAPACITY,
+                );
+            }
+
             // Update market betting stats
             Self::update_market_bet_stats(env, &market_id, &outcome, amount)?;
 
-            // Update market's total staked
-            market.total_staked = market
-                .total_staked
-                .checked_add(amount)
-                .ok_or(Error::InvalidInput)?;
-
             // Update votes and stakes for backward compatibility
+            // (`total_staked` was already updated in Phase 1)
             market.votes.set(user.clone(), outcome.clone());
             market.stakes.set(user.clone(), amount);
 
             MarketStateManager::update_market(env, &market_id, &market);
 
-            // Emit bet placed event
-            EventEmitter::emit_bet_placed(env, &market_id, &user, &outcome, amount);
+            pending_bet_events.push_back((market_id, outcome, amount));
 
             placed_bets.push_back(bet);
         }
 
-        // Phase 4: Emit batch event for the entire operation
-        EventEmitter::emit_bet_batch_placed(
-            env,
-            &user,
-            &bets,
-            total_amount,
-        );
-
-        // Phase 5: Consume the idempotency key so replays are rejected.
-        // Stored as temporary (cheaper rent) with PLACE_BETS_IDEM_TTL_LEDGERS TTL.
+        // Phase 4: Consume the idempotency key before publishing events. This
+        // is the final state-changing operation in the batch.
+        // Retain the replay guard for the full market-record horizon. A short
+        // seven-day TTL would allow a delayed transaction to be replayed after
+        // the guard expired and charge the user a second time.
         let ttl = crate::storage::PLACE_BETS_IDEM_TTL_LEDGERS;
         env.storage().persistent().set(&idem_key, &true);
         env.storage().persistent().extend_ttl(&idem_key, ttl, ttl);
+
+        // Phase 5: Publish events only after the whole batch has committed.
+        for (market_id, outcome, amount) in pending_bet_events.iter() {
+            EventEmitter::emit_bet_placed(env, &market_id, &user, &outcome, amount);
+        }
+
+        // Emit batch event for the entire operation.
+        EventEmitter::emit_bet_batch_placed(env, &user, &bets, total_amount);
 
         Ok(placed_bets)
     }
@@ -749,6 +889,20 @@ impl BetManager {
     /// Returns `true` if the user has already placed a bet, `false` otherwise.
     pub fn has_user_bet(env: &Env, market_id: &Symbol, user: &Address) -> bool {
         BetStorage::get_bet(env, market_id, user).is_some()
+    }
+
+    fn load_market_for_bet_commit(
+        env: &Env,
+        market_id: &Symbol,
+        amount: i128,
+    ) -> Result<Market, Error> {
+        let mut market = MarketStateManager::get_market(env, market_id)?;
+        BetValidator::validate_market_for_betting(env, &market)?;
+        market.total_staked = market
+            .total_staked
+            .checked_add(amount)
+            .ok_or(Error::InvalidInput)?;
+        Ok(market)
     }
 
     /// Get a user's bet on a specific market.
@@ -982,7 +1136,8 @@ impl BetManager {
             return Ok(0);
         }
 
-        let fee_percentage = crate::fees::FeeManager::get_fee_percentage_for_timestamp(env, bet.timestamp);
+        let fee_percentage =
+            crate::fees::FeeManager::get_fee_percentage_for_timestamp(env, bet.timestamp);
 
         let fee = (summary.total_pool * fee_percentage as i128) / 10_000;
         let distributable_pool = summary.total_pool - fee;
@@ -996,10 +1151,50 @@ impl BetManager {
 
         Ok(payout)
     }
-    /// Cancel a bet before the market deadline and refund the user.
+
+    /// Return the age of `bet` in seconds, saturating at zero.
     ///
-    /// This function allows users to cancel their active bets before the market
-    /// deadline, receiving a full refund of their locked funds.
+    /// Used by the cancellation-window checks below. `saturating_sub` keeps
+    /// the age non-negative even if the ledger clock is rewound in tests or if
+    /// a bet somehow carries a future timestamp.
+    fn bet_age_seconds(env: &Env, bet: &Bet) -> u64 {
+        env.ledger().timestamp().saturating_sub(bet.timestamp)
+    }
+
+    /// Return `true` while `bet` is still inside the configured cancellation
+    /// window.
+    ///
+    /// The window is **half-open**: a bet placed at `t` may be cancelled for
+    /// every `current_time < t + get_bet_cancel_window(env)`, and not at
+    /// `current_time == t + window`.
+    ///
+    /// # Parameters
+    ///
+    /// - `env` – Soroban environment
+    /// - `bet` – The bet whose age is compared against the window
+    pub fn is_within_cancel_window(env: &Env, bet: &Bet) -> bool {
+        Self::bet_age_seconds(env, bet) < get_bet_cancel_window(env)
+    }
+
+    /// Validate that `bet` may still be cancelled inside the configured window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::BetCancellationWindowClosed` once the window has elapsed.
+    pub fn validate_cancel_window(env: &Env, bet: &Bet) -> Result<(), Error> {
+        if Self::is_within_cancel_window(env, bet) {
+            Ok(())
+        } else {
+            Err(Error::BetCancellationWindowClosed)
+        }
+    }
+    /// Cancel a still-open bet within the configured cancellation window and
+    /// refund the user in full.
+    ///
+    /// This function allows users to cancel their active bets only within
+    /// `get_bet_cancel_window` seconds of placement, receiving a full refund
+    /// of their locked funds. Once the window has elapsed the bet is finalised
+    /// and can no longer be cancelled.
     ///
     /// # Parameters
     ///
@@ -1017,6 +1212,7 @@ impl BetManager {
     /// - `Error::NothingToClaim` - User has no bet on this market
     /// - `Error::MarketNotFound` - Market does not exist
     /// - `Error::MarketClosed` - Market deadline has passed
+    /// - `Error::BetCancellationWindowClosed` - The cancellation window has elapsed
     /// - `Error::InvalidState` - Bet is not in Active status
     ///
     /// # Security
@@ -1056,6 +1252,11 @@ impl BetManager {
             return Err(Error::MarketClosed);
         }
 
+        // Enforce the short, configurable cancellation window. A bet may only
+        // be cancelled within `get_bet_cancel_window` seconds of placement;
+        // afterwards it is finalised and the market's locked liquidity stands.
+        Self::validate_cancel_window(env, &bet)?;
+
         // Refund the locked funds
         BetUtils::unlock_funds(env, &user, bet.amount)?;
 
@@ -1072,7 +1273,10 @@ impl BetManager {
         market.stakes.remove(user.clone());
         MarketStateManager::update_market(env, &market_id, &market);
 
-        // Emit bet cancelled event
+        // Emit an explicit bet-cancelled event (topic catalog: `bet_cancelled`)
+        // so indexers can react without parsing status strings, followed by the
+        // generic status transition for backward compatibility.
+        EventEmitter::emit_bet_cancelled(env, &market_id, &user, bet.amount);
         EventEmitter::emit_bet_status_updated(
             env,
             &market_id,
@@ -1391,7 +1595,10 @@ impl BetValidator {
     /// # Errors
     ///
     /// - [`Error::BetBelowMarketMin`] when `amount < market.min_bet_amount`
-    pub fn validate_market_min_bet(market: &crate::types::Market, amount: i128) -> Result<(), Error> {
+    pub fn validate_market_min_bet(
+        market: &crate::types::Market,
+        amount: i128,
+    ) -> Result<(), Error> {
         if let Some(min) = market.min_bet_amount {
             if amount < min {
                 return Err(Error::BetBelowMarketMin);
@@ -1463,12 +1670,11 @@ impl BetValidator {
     pub fn validate_fee_slippage(env: &Env, max_fee_bps: i128) -> Result<(), Error> {
         let effective_fee_bps = match crate::config::ConfigManager::get_config(env) {
             Ok(cfg) => cfg.fees.platform_fee_percentage,
-            Err(_) => {
-                env.storage()
-                    .persistent()
-                    .get::<Symbol, i128>(&Symbol::new(env, "plat_fee"))
-                    .unwrap_or(crate::config::DEFAULT_PLATFORM_FEE_PERCENTAGE)
-            }
+            Err(_) => env
+                .storage()
+                .persistent()
+                .get::<Symbol, i128>(&Symbol::new(env, "plat_fee"))
+                .unwrap_or(crate::config::DEFAULT_PLATFORM_FEE_PERCENTAGE),
         };
 
         if effective_fee_bps > max_fee_bps {
@@ -1526,7 +1732,11 @@ impl BetValidator {
         // Store the cap in persistent storage
         let key = crate::storage::DataKey::MaxBetCap;
         env.storage().persistent().set(&key, &cap);
-        env.storage().persistent().extend_ttl(&key, crate::storage::MARKET_TTL_LEDGERS, crate::storage::MARKET_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &key,
+            crate::storage::MARKET_TTL_LEDGERS,
+            crate::storage::MARKET_TTL_LEDGERS,
+        );
 
         // Emit event
         crate::events::EventEmitter::emit_max_bet_cap_set(env, cap);
@@ -1547,10 +1757,7 @@ impl BetValidator {
     /// Returns the cumulative amount the user has bet on this market (0 if no prior bets).
     pub fn get_user_stake(env: &Env, market_id: &Symbol, user: &Address) -> i128 {
         let key = crate::storage::DataKey::UserStake(user.clone(), market_id.clone());
-        env.storage()
-            .persistent()
-            .get::<_, i128>(&key)
-            .unwrap_or(0)
+        env.storage().persistent().get::<_, i128>(&key).unwrap_or(0)
     }
 
     /// Update the cumulative stake for a user on a specific market.
@@ -1569,16 +1776,23 @@ impl BetValidator {
     /// # Returns
     ///
     /// Returns `Ok(())` on success.
-    pub fn update_user_stake(env: &Env, market_id: &Symbol, user: &Address, amount: i128) -> Result<(), Error> {
+    pub fn update_user_stake(
+        env: &Env,
+        market_id: &Symbol,
+        user: &Address,
+        amount: i128,
+    ) -> Result<(), Error> {
         let current_stake = Self::get_user_stake(env, market_id, user);
-        let new_stake = current_stake
-            .checked_add(amount)
-            .ok_or(Error::Overflow)?;
+        let new_stake = current_stake.checked_add(amount).ok_or(Error::Overflow)?;
 
         let key = crate::storage::DataKey::UserStake(user.clone(), market_id.clone());
         env.storage().persistent().set(&key, &new_stake);
         // Extend TTL to match market (365 days)
-        env.storage().persistent().extend_ttl(&key, crate::storage::MARKET_TTL_LEDGERS, crate::storage::MARKET_TTL_LEDGERS);
+        env.storage().persistent().extend_ttl(
+            &key,
+            crate::storage::MARKET_TTL_LEDGERS,
+            crate::storage::MARKET_TTL_LEDGERS,
+        );
 
         Ok(())
     }
@@ -1613,9 +1827,7 @@ impl BetValidator {
         // Check if a cap is set; if not, no validation needed (uncapped)
         if let Some(cap) = Self::get_max_bet_cap(env) {
             let current_stake = Self::get_user_stake(env, market_id, user);
-            let new_total = current_stake
-                .checked_add(amount)
-                .ok_or(Error::Overflow)?;
+            let new_total = current_stake.checked_add(amount).ok_or(Error::Overflow)?;
 
             if new_total > cap {
                 return Err(Error::MaxBetCapExceeded);
@@ -1839,6 +2051,156 @@ mod tests {
             86400,
             MarketState::Active,
         )
+    }
+
+    #[test]
+    fn test_bet_commit_rejects_market_resolved_after_initial_validation() {
+        let env = Env::default();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let market_id = Symbol::new(&env, "commit_resolved_market");
+        let end_time = env.ledger().timestamp() + 10_000;
+
+        env.as_contract(&contract_id, || {
+            let mut market = test_market(&env, end_time);
+            MarketStateManager::update_market(&env, &market_id, &market);
+
+            assert!(BetManager::load_market_for_bet_commit(&env, &market_id, 5).is_ok());
+
+            market.state = MarketState::Resolved;
+            let mut winning_outcomes = soroban_sdk::Vec::new(&env);
+            winning_outcomes.push_back(String::from_str(&env, "yes"));
+            market.winning_outcomes = Some(winning_outcomes);
+            MarketStateManager::update_market(&env, &market_id, &market);
+
+            assert_eq!(
+                BetManager::load_market_for_bet_commit(&env, &market_id, 5).err(),
+                Some(Error::MarketClosed)
+            );
+        });
+    }
+
+    /// A failure on entry #3 of a batch must leave no trace of entries #1 and #2.
+    #[test]
+    fn test_place_bets_mid_batch_failure_writes_no_state() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let user = Address::generate(&env);
+        let end_time = env.ledger().timestamp() + 10_000;
+
+        env.as_contract(&contract_id, || {
+            let m1 = Symbol::new(&env, "batch_m1");
+            let m2 = Symbol::new(&env, "batch_m2");
+            let m3 = Symbol::new(&env, "batch_m3");
+            MarketStateManager::update_market(&env, &m1, &test_market(&env, end_time));
+            MarketStateManager::update_market(&env, &m2, &test_market(&env, end_time));
+            MarketStateManager::update_market(&env, &m3, &test_market(&env, end_time));
+
+            let yes = String::from_str(&env, "yes");
+            let bogus = String::from_str(&env, "maybe");
+            let amount = 10_000_000i128;
+            let key = BytesN::from_array(&env, &[7u8; 32]);
+
+            let cases: [(Symbol, String, Error); 3] = [
+                // Entry #3 targets a market that does not exist.
+                (
+                    Symbol::new(&env, "batch_none"),
+                    yes.clone(),
+                    Error::MarketNotFound,
+                ),
+                // Entry #3 has an invalid outcome.
+                (m3.clone(), bogus, Error::InvalidOutcome),
+                // Entry #3 repeats entry #1's market.
+                (m1.clone(), yes.clone(), Error::AlreadyBet),
+            ];
+
+            for (third_market, third_outcome, expected) in cases {
+                let bets = soroban_sdk::vec![
+                    &env,
+                    (m1.clone(), yes.clone(), amount),
+                    (m2.clone(), yes.clone(), amount),
+                    (third_market, third_outcome, amount),
+                ];
+                let result = BetManager::place_bets(&env, user.clone(), bets, 10_000, key.clone());
+                assert_eq!(result.err(), Some(expected));
+
+                for m in [&m1, &m2, &m3] {
+                    assert!(BetManager::get_bet(&env, m, &user).is_none());
+                    assert_eq!(BetValidator::get_user_stake(&env, m, &user), 0);
+                    assert_eq!(BetManager::get_market_bet_stats(&env, m).total_bets, 0);
+                    let market = MarketStateManager::get_market(&env, m).unwrap();
+                    assert_eq!(market.total_staked, 0);
+                    assert!(market.stakes.get(user.clone()).is_none());
+                }
+                // Idempotency key must not be consumed by a failed batch.
+                let idem = crate::storage::DataKey::PlaceBetsIdem(user.clone(), key.clone());
+                assert!(!env.storage().persistent().has(&idem));
+            }
+        });
+    }
+
+    #[test]
+    fn test_place_bet_replaces_existing_pool_and_escrow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register(crate::PredictifyHybrid, ());
+        let user = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_contract.address();
+        let token_client = soroban_sdk::token::Client::new(&env, &token_address);
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+        token_admin_client.mint(&user, &10_000_000i128);
+
+        let market_id = Symbol::new(&env, "replace_bet");
+        let yes = String::from_str(&env, "yes");
+        let no = String::from_str(&env, "no");
+        env.as_contract(&contract_id, || {
+            env.storage()
+                .persistent()
+                .set(&Symbol::new(&env, "TokenID"), &token_address);
+            MarketStateManager::update_market(
+                &env,
+                &market_id,
+                &test_market(&env, env.ledger().timestamp() + 10_000),
+            );
+
+            BetManager::place_bet(
+                &env,
+                user.clone(),
+                market_id.clone(),
+                yes.clone(),
+                1_000_000,
+                10_000,
+            )
+            .unwrap();
+            BetManager::place_bet(
+                &env,
+                user.clone(),
+                market_id.clone(),
+                no.clone(),
+                2_000_000,
+                10_000,
+            )
+            .unwrap();
+
+            let stats = BetManager::get_market_bet_stats(&env, &market_id);
+            assert_eq!(stats.total_bets, 1);
+            assert_eq!(stats.total_amount_locked, 2_000_000);
+            assert_eq!(stats.outcome_totals.get(yes.clone()), None);
+            assert_eq!(stats.outcome_totals.get(no.clone()), Some(2_000_000));
+
+            let market = MarketStateManager::get_market(&env, &market_id).unwrap();
+            assert_eq!(market.total_staked, 2_000_000);
+            assert_eq!(
+                token_client.balance(&env.current_contract_address()),
+                2_000_000
+            );
+
+            let bet = BetManager::get_bet(&env, &market_id, &user).unwrap();
+            assert_eq!(bet.outcome, no);
+            assert_eq!(bet.amount, 2_000_000);
+        });
     }
 
     #[test]
@@ -2142,7 +2504,10 @@ mod tests {
             min_bet: MIN_BET_AMOUNT - 1,
             max_bet: MAX_BET_AMOUNT,
         };
-        assert_eq!(set_global_bet_limits(&env, &bad), Err(Error::InsufficientStake));
+        assert_eq!(
+            set_global_bet_limits(&env, &bad),
+            Err(Error::InsufficientStake)
+        );
     }
 
     #[test]
@@ -2354,7 +2719,13 @@ mod tests {
         let user2 = Address::generate(&env);
         let outcome = String::from_str(&env, "yes");
 
-        let bet1 = Bet::new(&env, user1.clone(), market_id.clone(), outcome.clone(), 1_000_000);
+        let bet1 = Bet::new(
+            &env,
+            user1.clone(),
+            market_id.clone(),
+            outcome.clone(),
+            1_000_000,
+        );
         let bet2 = Bet::new(&env, user2.clone(), market_id.clone(), outcome, 2_000_000);
         BetStorage::store_bet(&env, &bet1).unwrap();
         BetStorage::store_bet(&env, &bet2).unwrap();
@@ -2368,7 +2739,10 @@ mod tests {
         let env = Env::default();
         let market = test_market(&env, 10_000);
         // bet_deadline defaults to 0 in test_market
-        assert_eq!(BetValidator::effective_bet_deadline(&market).unwrap(), 10_000);
+        assert_eq!(
+            BetValidator::effective_bet_deadline(&market).unwrap(),
+            10_000
+        );
     }
 
     #[test]
@@ -2376,7 +2750,10 @@ mod tests {
         let env = Env::default();
         let mut market = test_market(&env, 10_000);
         market.bet_deadline = 8_000;
-        assert_eq!(BetValidator::effective_bet_deadline(&market).unwrap(), 8_000);
+        assert_eq!(
+            BetValidator::effective_bet_deadline(&market).unwrap(),
+            8_000
+        );
     }
 
     #[test]
@@ -2406,7 +2783,9 @@ mod tests {
             Err(Error::InsufficientStake)
         );
         // Within per-event bounds
-        assert!(BetValidator::validate_bet_amount_against_limits(&env, &market_id, 10_000_000).is_ok());
+        assert!(
+            BetValidator::validate_bet_amount_against_limits(&env, &market_id, 10_000_000).is_ok()
+        );
         // Above per-event max
         assert_eq!(
             BetValidator::validate_bet_amount_against_limits(&env, &market_id, 30_000_000_000),
@@ -2426,6 +2805,131 @@ mod tests {
             Err(Error::BetExceedsCap)
         );
         // Within per-market cap
-        assert!(BetValidator::validate_bet_amount_against_limits(&env, &market_id, 2_000_000).is_ok());
+        assert!(
+            BetValidator::validate_bet_amount_against_limits(&env, &market_id, 2_000_000).is_ok()
+        );
+    }
+
+    // ===== Bet cancellation window =====
+
+    /// Set the ledger timestamp to an absolute value.
+    fn set_ledger_time(env: &Env, ts: u64) {
+        env.ledger().set(LedgerInfo {
+            timestamp: ts,
+            protocol_version: 25,
+            sequence_number: env.ledger().sequence(),
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 10000,
+        });
+    }
+
+    #[test]
+    fn test_cancel_window_defaults_when_unset() {
+        let env = Env::default();
+        assert_eq!(get_bet_cancel_window(&env), DEFAULT_BET_CANCEL_WINDOW_SECONDS);
+    }
+
+    #[test]
+    fn test_set_cancel_window_roundtrip() {
+        let env = Env::default();
+        set_bet_cancel_window(&env, 120).unwrap();
+        assert_eq!(get_bet_cancel_window(&env), 120);
+    }
+
+    #[test]
+    fn test_set_cancel_window_rejects_zero() {
+        let env = Env::default();
+        assert_eq!(set_bet_cancel_window(&env, 0), Err(Error::InvalidInput));
+        // Rejected values must not clobber the stored/default window.
+        assert_eq!(get_bet_cancel_window(&env), DEFAULT_BET_CANCEL_WINDOW_SECONDS);
+    }
+
+    #[test]
+    fn test_set_cancel_window_rejects_above_max() {
+        let env = Env::default();
+        assert_eq!(
+            set_bet_cancel_window(&env, MAX_BET_CANCEL_WINDOW_SECONDS + 1),
+            Err(Error::InvalidInput)
+        );
+    }
+
+    /// The window is half-open: `[placed_at, placed_at + window)`.
+    #[test]
+    fn test_cancel_window_boundary_is_half_open() {
+        let env = Env::default();
+        set_bet_cancel_window(&env, 300).unwrap();
+
+        let user = Address::generate(&env);
+        let bet = Bet::new(
+            &env,
+            user,
+            Symbol::new(&env, "mkt_cwin"),
+            String::from_str(&env, "yes"),
+            10_000_000,
+        );
+        let placed_at = bet.timestamp;
+
+        // One second before the boundary: still cancellable.
+        set_ledger_time(&env, placed_at + 299);
+        assert!(BetManager::is_within_cancel_window(&env, &bet));
+        assert!(BetManager::validate_cancel_window(&env, &bet).is_ok());
+
+        // Exactly at the boundary: closed.
+        set_ledger_time(&env, placed_at + 300);
+        assert!(!BetManager::is_within_cancel_window(&env, &bet));
+        assert_eq!(
+            BetManager::validate_cancel_window(&env, &bet),
+            Err(Error::BetCancellationWindowClosed)
+        );
+
+        // Past the boundary: still closed.
+        set_ledger_time(&env, placed_at + 301);
+        assert_eq!(
+            BetManager::validate_cancel_window(&env, &bet),
+            Err(Error::BetCancellationWindowClosed)
+        );
+    }
+
+    #[test]
+    fn test_cancel_window_honors_admin_override() {
+        let env = Env::default();
+        set_bet_cancel_window(&env, 60).unwrap();
+
+        let user = Address::generate(&env);
+        let bet = Bet::new(
+            &env,
+            user,
+            Symbol::new(&env, "mkt_cwin_ovr"),
+            String::from_str(&env, "no"),
+            5_000_000,
+        );
+        let placed_at = bet.timestamp;
+
+        set_ledger_time(&env, placed_at + 61);
+        assert_eq!(
+            BetManager::validate_cancel_window(&env, &bet),
+            Err(Error::BetCancellationWindowClosed)
+        );
+
+        // Widening the window re-opens cancellation for the same bet age.
+        set_bet_cancel_window(&env, 120).unwrap();
+        assert!(BetManager::validate_cancel_window(&env, &bet).is_ok());
+    }
+
+    #[test]
+    fn test_cancellation_window_error_metadata_is_stable() {
+        assert_eq!(Error::BetCancellationWindowClosed as u32, 114);
+        assert_eq!(
+            Error::BetCancellationWindowClosed.code(),
+            "BET_CANCELLATION_WINDOW_CLOSED"
+        );
+        assert!(!Error::BetCancellationWindowClosed.description().is_empty());
+        assert_ne!(
+            Error::BetCancellationWindowClosed as u32,
+            Error::MarketClosed as u32
+        );
     }
 }

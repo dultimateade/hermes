@@ -18,12 +18,19 @@ pub enum ContractError {
     /// Invalid outcome; thrown when the provided outcome is not supported by the market.
     InvalidOutcome = 6,
     /// Invalid configuration; thrown when market setup parameters are out of bounds.
+    ///
+    /// Also returned at initialization when the network's maximum storage TTL is
+    /// insufficient to honour `MARKET_PAYOUT_CURVE_TTL_LEDGERS` (see #347).
     InvalidConfig = 7,
     /// Overflow; thrown when math operations overflow, preventing unsafe state changes.
     Overflow = 8,
     /// Stake too small; thrown when a deposit or bet is below the minimum threshold.
     StakeTooSmall = 9,
     /// Invalid State; thrown when a generic state transition fails.
+    ///
+    /// Also returned when an internal invariant is violated, e.g. the global
+    /// liquidity reward index is below a provider's stored reward debt during
+    /// `remove_liquidity` (see #342).
     InvalidState = 10,
     /// Admin action timelocked; thrown when an admin action is invoked before the cooldown has elapsed.
     AdminActionTimelocked = 11,
@@ -34,6 +41,35 @@ pub enum ContractError {
     AdminAddressInvalid = 13,
     /// The requested admin operation is not permitted in the current contract state.
     AdminOperationNotPermitted = 14,
+    /// Winnings already claimed; thrown when a winner attempts to claim a second time
+    /// for the same market.  Guards the checks-effects-interactions invariant in
+    /// `claim_winnings`: the `ClaimedBet` flag is written and re-verified inside
+    /// each payout-loop iteration, before every transfer, so a re-entrant call
+    /// injected via a token hook cannot collect a second payout (see #339).
+    AlreadyClaimed = 15,
+    /// Proposal not found; thrown when interacting with a non-existent pause proposal.
+    ProposalNotFound = 16,
+    /// Duplicate approval; thrown when an admin attempts to approve the same proposal twice.
+    ProposalAlreadyApproved = 17,
+    /// Proposal not executable; timelock has not expired or approval threshold not met.
+    ProposalNotExecutable = 18,
+    /// Invalid payout curve configuration.
+    ///
+    /// Returned at curve configuration time when the outcome weights are invalid,
+    /// including the case where all weights sum to zero, which would otherwise
+    /// cause a division-by-zero panic at resolution (see #340).
+    InvalidPayoutCurve = 19,
+    /// Insufficient balance for withdrawal or operation.
+    InsufficientBalance = 20,
+    /// The configured maximum number of markets has been reached.
+    MarketLimitReached = 21,
+    /// Contract has not been initialized; thrown when a state-changing entrypoint
+    /// is invoked before `initialize` has been called.
+    NotInitialized = 22,
+    /// The provided admin address is already present in the admin list.
+    AdminAlreadyExists = 23,
+    /// The creator has reached the configured per-address market limit.
+    CreatorMarketLimitReached = 24,
 }
 
 #[cfg(test)]
@@ -56,5 +92,15 @@ mod tests {
         assert_eq!(ContractError::AdminCooldownActive as u32, 12);
         assert_eq!(ContractError::AdminAddressInvalid as u32, 13);
         assert_eq!(ContractError::AdminOperationNotPermitted as u32, 14);
+        assert_eq!(ContractError::AlreadyClaimed as u32, 15);
+        assert_eq!(ContractError::ProposalNotFound as u32, 16);
+        assert_eq!(ContractError::ProposalAlreadyApproved as u32, 17);
+        assert_eq!(ContractError::ProposalNotExecutable as u32, 18);
+        assert_eq!(ContractError::InvalidPayoutCurve as u32, 19);
+        assert_eq!(ContractError::InsufficientBalance as u32, 20);
+        assert_eq!(ContractError::MarketLimitReached as u32, 21);
+        assert_eq!(ContractError::NotInitialized as u32, 22);
+        assert_eq!(ContractError::AdminAlreadyExists as u32, 23);
+        assert_eq!(ContractError::CreatorMarketLimitReached as u32, 24);
     }
 }

@@ -54,6 +54,16 @@ pub fn migrate_error_state(
     expected: u32,
     target: u32,
 ) -> Result<(), ContractError> {
+    migrate_error_state_with(env, admin, expected, target, reshape_errors)
+}
+
+fn migrate_error_state_with(
+    env: &Env,
+    admin: &Address,
+    expected: u32,
+    target: u32,
+    apply_steps: impl FnOnce(&Env, u32, u32) -> Result<(), ContractError>,
+) -> Result<(), ContractError> {
     // --- Guard: contract must be initialised ---
     if !env.storage().instance().has(&DataKey::Admin) {
         return Err(ContractError::NotInitialized);
@@ -83,9 +93,9 @@ pub fn migrate_error_state(
     }
 
     // --- Data reshape (to be extended per-version) ---
-    reshape_errors(env, current, target);
+    apply_steps(env, current, target)?;
 
-    // --- Bump version ---
+    // The version is the commit marker: only advance it after every step succeeds.
     env.storage().instance().set(&DataKey::Version, &target);
 
     Ok(())
@@ -95,6 +105,35 @@ pub fn migrate_error_state(
 ///
 /// Each version pair that introduces an error-structure change should add a
 /// match arm here. The default arm is a no-op.
-fn reshape_errors(_env: &Env, from: u32, to: u32) {
+fn reshape_errors(_env: &Env, from: u32, to: u32) -> Result<(), ContractError> {
     let _ = (from, to);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn failed_migration_step_does_not_advance_version() {
+        let env = Env::default();
+        let contract_id = env.register(crate::MigrateContract, ());
+        let admin = Address::generate(&env);
+
+        let result = env.as_contract(&contract_id, || {
+            env.storage().instance().set(&DataKey::Admin, &admin);
+            env.storage().instance().set(&DataKey::Version, &1_u32);
+
+            migrate_error_state_with(&env, &admin, 1, 2, |_, _, _| {
+                Err(ContractError::MigrationFailed)
+            })
+        });
+
+        assert_eq!(result, Err(ContractError::MigrationFailed));
+        env.as_contract(&contract_id, || {
+            let version: u32 = env.storage().instance().get(&DataKey::Version).unwrap();
+            assert_eq!(version, 1);
+        });
+    }
 }

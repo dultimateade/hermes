@@ -31,4 +31,6 @@ pub enum AllowlistError {
     InvalidInput = 9,
     /// Arithmetic overflow occurred.
     Overflow = 10,
+    /// The allowlist's persistent storage entry has expired.
+    AllowlistExpired = 11,
 }

@@ -32,7 +32,7 @@
 //!
 //! | Entrypoint           | CPU threshold | Mem threshold | Notes                         |
 //! |----------------------|--------------|--------------|-------------------------------|
-//! | `add_oracle`         | 500 000      | 150 000      | 1 read + 1 write + auth check |
+//! | `add_oracle`         | 500 000      | 150 000      | capability call + read/write + auth |
 //! | `remove_oracle`      | 500 000      | 150 000      | 1 read + 1 write + auth check |
 //! | `list_oracles`       | 200 000      |  60 000      | 1 read, no auth               |
 //! | `get_price`          | 300 000      |  80 000      | 1 read, early-exit on no-reg  |
@@ -44,11 +44,21 @@
 //! Tighten them once `stellar contract invoke --cost` p99 values are
 //! available from a production deployment.
 
-use oracles::{Error, OraclesContract, OraclesContractClient};
+use oracles::{CapabilityFlag, Error, OraclesContract, OraclesContractClient};
 use soroban_sdk::{
     testutils::Address as _,
-    Address, Env, String,
+    contract, contractimpl, Address, Env, String,
 };
+
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+}
 
 // -----------------------------------------------------------------------
 // CPU-instruction thresholds (upper bound per call)
@@ -147,7 +157,7 @@ impl Fx {
 
     /// Register an oracle and return its address.
     fn add(&self, oracle: &Address) {
-        self.client().add_oracle(&self.admin, oracle);
+        self.client().add_oracle(&self.admin, oracle).unwrap();
     }
 }
 
@@ -159,10 +169,10 @@ impl Fx {
 #[test]
 fn snap_add_oracle_first() {
     let f = Fx::new();
-    let oracle = Address::generate(&f.env);
+    let oracle = f.env.register(MockOracle, ());
 
     let b = snap(&f.env);
-    f.client().add_oracle(&f.admin, &oracle);
+    f.client().add_oracle(&f.admin, &oracle).unwrap();
     let (cpu, mem) = delta(b, snap(&f.env));
 
     assert_budget("add_oracle/first", cpu, mem, ADD_ORACLE_CPU, ADD_ORACLE_MEM);
@@ -174,11 +184,11 @@ fn snap_add_oracle_first() {
 #[test]
 fn snap_add_oracle_duplicate() {
     let f = Fx::new();
-    let oracle = Address::generate(&f.env);
+    let oracle = f.env.register(MockOracle, ());
     f.add(&oracle);
 
     let b = snap(&f.env);
-    f.client().add_oracle(&f.admin, &oracle);
+    f.client().add_oracle(&f.admin, &oracle).unwrap();
     let (cpu, mem) = delta(b, snap(&f.env));
 
     assert_budget("add_oracle/duplicate", cpu, mem, ADD_ORACLE_CPU, ADD_ORACLE_MEM);
@@ -192,12 +202,13 @@ fn snap_add_oracle_duplicate() {
 fn snap_add_oracle_with_existing() {
     let f = Fx::new();
     for _ in 0..3 {
-        f.add(&Address::generate(&f.env));
+        let oracle = f.env.register(MockOracle, ());
+        f.add(&oracle);
     }
-    let new_oracle = Address::generate(&f.env);
+    let new_oracle = f.env.register(MockOracle, ());
 
     let b = snap(&f.env);
-    f.client().add_oracle(&f.admin, &new_oracle);
+    f.client().add_oracle(&f.admin, &new_oracle).unwrap();
     let (cpu, mem) = delta(b, snap(&f.env));
 
     assert_budget("add_oracle/with_existing", cpu, mem, ADD_ORACLE_CPU, ADD_ORACLE_MEM);
@@ -211,7 +222,7 @@ fn snap_add_oracle_with_existing() {
 #[test]
 fn snap_remove_oracle_present() {
     let f = Fx::new();
-    let oracle = Address::generate(&f.env);
+    let oracle = f.env.register(MockOracle, ());
     f.add(&oracle);
 
     let b = snap(&f.env);
@@ -227,7 +238,8 @@ fn snap_remove_oracle_present() {
 #[test]
 fn snap_remove_oracle_absent() {
     let f = Fx::new();
-    f.add(&Address::generate(&f.env)); // non-empty list
+    let registered = f.env.register(MockOracle, ());
+    f.add(&registered);
     let unknown = Address::generate(&f.env);
 
     let b = snap(&f.env);
@@ -271,7 +283,8 @@ fn snap_list_oracles_empty() {
 #[test]
 fn snap_list_oracles_one() {
     let f = Fx::new();
-    f.add(&Address::generate(&f.env));
+    let oracle = f.env.register(MockOracle, ());
+    f.add(&oracle);
 
     let b = snap(&f.env);
     let list = f.client().list_oracles();
@@ -289,7 +302,8 @@ fn snap_list_oracles_one() {
 fn snap_list_oracles_three() {
     let f = Fx::new();
     for _ in 0..3 {
-        f.add(&Address::generate(&f.env));
+        let oracle = f.env.register(MockOracle, ());
+        f.add(&oracle);
     }
 
     let b = snap(&f.env);
@@ -396,7 +410,8 @@ fn snap_is_oracle_healthy_unregistered() {
     let unregistered = Address::generate(&f.env);
 
     let b = snap(&f.env);
-    let result = f.client().try_is_oracle_healthy(&unregistered);
+    let feed = String::from_str(&f.env, "BTC/USD");
+    let result = f.client().try_is_oracle_healthy(&unregistered, &feed);
     let (cpu, mem) = delta(b, snap(&f.env));
 
     assert_eq!(
@@ -420,7 +435,8 @@ fn snap_is_oracle_healthy_empty_registry() {
     let oracle = Address::generate(&f.env);
 
     let b = snap(&f.env);
-    let result = f.client().try_is_oracle_healthy(&oracle);
+    let feed = String::from_str(&f.env, "BTC/USD");
+    let result = f.client().try_is_oracle_healthy(&oracle, &feed);
     let (cpu, mem) = delta(b, snap(&f.env));
 
     assert_eq!(result, Err(Ok(Error::InvalidOracleConfig)));

@@ -1,0 +1,32 @@
+{
+  "contract": "admin",
+  "description": "Per-entrypoint Soroban budget thresholds for admin gas snapshot tests. Tests apply a 5% ceiling to the configured CPU and memory values.",
+  "default_max_regression_pct": 5.0,
+  "thresholds": {
+    "initialize": {
+      "max_cpu_insns": 55643,
+      "max_mem_bytes": 20337,
+      "description": "Admin contract initialization"
+    },
+    "admin": {
+      "max_cpu_insns": 31614,
+      "max_mem_bytes": 12495,
+      "description": "Read the configured admin address"
+    },
+    "set_admin_cooldown": {
+      "max_cpu_insns": 45000,
+      "max_mem_bytes": 18000,
+      "description": "Set the admin cooldown"
+    },
+    "get_admin_cooldown": {
+      "max_cpu_insns": 28000,
+      "max_mem_bytes": 10000,
+      "description": "Read the admin cooldown"
+    },
+    "check_admin_cooldown": {
+      "max_cpu_insns": 52000,
+      "max_mem_bytes": 19000,
+      "description": "Check and record an admin action cooldown"
+    }
+  }
+}

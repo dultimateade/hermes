@@ -1,0 +1,27 @@
+{
+  "contract": "migrate",
+  "description": "Per-entrypoint Soroban budget thresholds for the migrate contract gas snapshot tests.",
+  "default_max_regression_pct": 5.0,
+  "thresholds": {
+    "initialize": {
+      "max_cpu_insns": 55643,
+      "max_mem_bytes": 20337,
+      "description": "Migrate contract initialization"
+    },
+    "migrate": {
+      "max_cpu_insns": 69405,
+      "max_mem_bytes": 22409,
+      "description": "Authenticated migration happy path"
+    },
+    "admin": {
+      "max_cpu_insns": 32500,
+      "max_mem_bytes": 13000,
+      "description": "Admin read entrypoint"
+    },
+    "current_version": {
+      "max_cpu_insns": 32500,
+      "max_mem_bytes": 13000,
+      "description": "Current-version read entrypoint"
+    }
+  }
+}

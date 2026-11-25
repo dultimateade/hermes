@@ -1,4 +1,40 @@
 #!/usr/bin/env bash
+# verify_contract_sync.sh
+#
+# Purpose:
+#   Verifies that the locally-built WASM artifact for a given Soroban/Stellar
+#   contract matches the bytecode currently deployed on staging and production.
+#   This catches "contract drift" — situations where a deployment falls out of
+#   sync with the code in the repository.
+#
+# How it works:
+#   1. Builds the specified Cargo package as a WASM release artifact.
+#   2. Computes the SHA-256 hash of the resulting .wasm file.
+#   3. Fetches the deployed contract bytecode from both staging and production
+#      networks using the Stellar CLI.
+#   4. Compares the SHA-256 hash of each fetched contract against the local
+#      build. Exits non-zero if any mismatch is detected.
+#
+# When to run:
+#   - Before or after a deployment to confirm the on-chain bytecode matches the
+#     expected source revision.
+#   - In CI/CD pipelines as a post-deploy verification gate.
+#   - Ad-hoc during incident triage to confirm whether a live contract is stale.
+#
+# Prerequisites:
+#   cargo, stellar CLI, sha256sum
+#
+# Usage:
+#   CONTRACT=markets \
+#   STAGING_CONTRACT_ID=<staging-contract-id> \
+#   PRODUCTION_CONTRACT_ID=<production-contract-id> \
+#   ./scripts/verify_contract_sync.sh
+#
+# Optional environment variables:
+#   STAGING_NETWORK     Stellar CLI network alias for staging  (default: testnet)
+#   PRODUCTION_NETWORK  Stellar CLI network alias for production (default: mainnet)
+#
+# See also: scripts/verify_contract_sync.sh --help
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

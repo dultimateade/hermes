@@ -1,15 +1,20 @@
 #![cfg(test)]
 
 use soroban_sdk::{
-    contract, contractimpl, testutils::Address as _, Address, Env, String,
+    contract, contractimpl, testutils::{Address as _, MockAuth, MockAuthInvoke}, Address, Env,
+    IntoVal, String,
 };
-use oracles::{OraclesContract, OraclesContractClient, OraclePriceData};
+use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient, OraclePriceData};
 
 #[contract]
 pub struct MockOracleForAuthSnap;
 
 #[contractimpl]
 impl MockOracleForAuthSnap {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+
     pub fn get_price(_env: Env, _feed_id: String) -> i128 {
         99999
     }
@@ -61,7 +66,7 @@ fn test_add_oracle_requires_auth_and_succeeds_with_mock() {
     setup.env.mock_all_auths();
 
     // Call add_oracle with mocked auth
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
 
     // Verify auth was checked for admin
     let auths = setup.env.auths();
@@ -79,7 +84,7 @@ fn test_add_oracle_requires_auth_and_succeeds_with_mock() {
 fn test_add_oracle_fails_without_auth() {
     let setup = setup_test_env();
     // Do NOT call mock_all_auths
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
 }
 
 #[test]
@@ -88,7 +93,7 @@ fn test_remove_oracle_requires_auth_and_succeeds_with_mock() {
     setup.env.mock_all_auths();
 
     // Add oracle first
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
     assert_eq!(setup.client.list_oracles().len(), 1);
 
     // Remove oracle with mocked auth
@@ -110,7 +115,7 @@ fn test_remove_oracle_fails_without_auth() {
     setup.env.mock_all_auths();
 
     // Add oracle first
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
 
     // Create a new env without mock_all_auths to test remove_oracle failure
     let unauth_env = Env::default();
@@ -121,6 +126,46 @@ fn test_remove_oracle_fails_without_auth() {
     client.remove_oracle(&admin, &oracle);
 }
 
+#[test]
+#[should_panic]
+fn test_add_oracle_rejects_non_admin_signer() {
+    let setup = setup_test_env();
+    let outsider = Address::generate(&setup.env);
+    setup.env.mock_all_auths();
+    setup.client.add_oracle(&setup.admin, &setup.oracle);
+
+    setup.env.mock_auths(&[MockAuth {
+        address: &setup.admin,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "add_oracle",
+            args: (&setup.admin, &setup.oracle).into_val(&setup.env),
+            sub_invokes: &[],
+        },
+    }]);
+    setup.client.add_oracle(&outsider, &setup.oracle);
+}
+
+#[test]
+#[should_panic]
+fn test_remove_oracle_rejects_non_admin_signer() {
+    let setup = setup_test_env();
+    let outsider = Address::generate(&setup.env);
+    setup.env.mock_all_auths();
+    setup.client.add_oracle(&setup.admin, &setup.oracle);
+
+    setup.env.mock_auths(&[MockAuth {
+        address: &setup.admin,
+        invoke: &MockAuthInvoke {
+            contract: &setup.contract_id,
+            fn_name: "remove_oracle",
+            args: (&setup.admin, &setup.oracle).into_val(&setup.env),
+            sub_invokes: &[],
+        },
+    }]);
+    setup.client.remove_oracle(&outsider, &setup.oracle);
+}
+
 // ---------------------------------------------------------------------------
 // 2. Read-only entrypoints do not require auth
 // ---------------------------------------------------------------------------
@@ -129,7 +174,7 @@ fn test_remove_oracle_fails_without_auth() {
 fn test_view_entrypoints_do_not_require_auth() {
     let setup = setup_test_env();
     setup.env.mock_all_auths();
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
 
     // Create environment without auth mocking for queries
     let query_env = Env::default();
@@ -139,7 +184,7 @@ fn test_view_entrypoints_do_not_require_auth() {
     let admin = Address::generate(&query_env);
     let oracle_addr = query_env.register(MockOracleForAuthSnap, ());
 
-    client.add_oracle(&admin, &oracle_addr);
+    client.add_oracle(&admin, &oracle_addr).unwrap();
 
     // Test list_oracles
     let list = client.list_oracles();
@@ -156,7 +201,7 @@ fn test_view_entrypoints_do_not_require_auth() {
     assert_eq!(pdata.publish_time, 1000);
 
     // Test is_oracle_healthy
-    assert!(client.is_oracle_healthy(&oracle_addr));
+    assert!(client.is_oracle_healthy(&oracle_addr, &feed));
 }
 
 // ---------------------------------------------------------------------------
@@ -171,13 +216,13 @@ fn test_auth_snapshot_multi_oracle_sequence() {
     let oracle2 = setup.env.register(MockOracleForAuthSnap, ());
 
     // First add_oracle call
-    setup.client.add_oracle(&setup.admin, &setup.oracle);
+    setup.client.add_oracle(&setup.admin, &setup.oracle).unwrap();
     let auths1 = setup.env.auths();
     assert_eq!(auths1.len(), 1);
     assert_eq!(auths1[0].0, setup.admin);
 
     // Second add_oracle call
-    setup.client.add_oracle(&setup.admin, &oracle2);
+    setup.client.add_oracle(&setup.admin, &oracle2).unwrap();
     let auths2 = setup.env.auths();
     assert_eq!(auths2.len(), 1);
     assert_eq!(auths2[0].0, setup.admin);

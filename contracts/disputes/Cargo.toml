@@ -24,5 +24,9 @@ name = "dispute_edge_cases"
 path = "tests/dispute_edge_cases.rs"
 
 [[test]]
+name = "dispute_storage"
+path = "tests/dispute_storage.rs"
+
+[[test]]
 name = "xcontract"
 path = "tests/xcontract.rs"

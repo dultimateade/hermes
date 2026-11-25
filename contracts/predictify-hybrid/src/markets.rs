@@ -12,6 +12,12 @@ use crate::storage::{
 use crate::types::*;
 // Oracle imports removed - not currently used
 
+/// Maximum length, in bytes, of a market question.
+///
+/// Mirrors the documented contract API (1-500 characters) and keeps the stored
+/// question bounded, so metadata commitments remain cheap to compute and verify.
+pub const MAX_QUESTION_LENGTH: u32 = 500;
+
 /// Market management system for Predictify Hybrid contract
 ///
 /// This module provides a comprehensive market management system with:
@@ -43,7 +49,8 @@ impl MarketCreator {
     /// * `env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator (must have sufficient balance for fees)
     /// * `question` - The prediction question (1-500 characters, cannot be empty)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10 outcomes)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `oracle_config` - Oracle configuration specifying data source and resolution criteria
     ///
@@ -58,7 +65,9 @@ impl MarketCreator {
     /// * `Error::InvalidOutcomes` - Less than 2 outcomes or empty outcome strings
     /// * `Error::InvalidDuration` - Duration is 0 or exceeds 365 days
     /// * `Error::InsufficientBalance` - Admin lacks funds for creation fee
-    /// * `Error::InvalidOracleConfig` - Oracle configuration is malformed
+    /// * `Error::InvalidThreshold` - Oracle threshold is zero or negative
+    /// * `Error::InvalidOracleFeed` - Oracle feed ID is empty
+    /// * `Error::InvalidComparison` - Oracle comparison operator is empty
     ///
     /// # Example
     ///
@@ -163,7 +172,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `asset_symbol` - Reflector asset symbol (e.g., "BTC", "ETH", "XLM")
     /// * `threshold` - Price threshold for comparison (in asset's base units)
@@ -176,8 +186,7 @@ impl MarketCreator {
     ///
     /// # Errors
     ///
-    /// Same as `create_market`, plus:
-    /// * `Error::InvalidOracleConfig` - Invalid asset symbol or comparison operator
+    /// Same as `create_market`.
     ///
     /// # Example
     ///
@@ -245,7 +254,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `feed_id` - Pyth price feed identifier (e.g., "BTC/USD", "ETH/USD")
     /// * `threshold` - Price threshold for comparison (in feed's base units)
@@ -258,8 +268,7 @@ impl MarketCreator {
     ///
     /// # Errors
     ///
-    /// Same as `create_market`, plus:
-    /// * `Error::InvalidOracleConfig` - Invalid feed ID or comparison operator
+    /// Same as `create_market`.
     ///
     /// # Example
     ///
@@ -328,7 +337,8 @@ impl MarketCreator {
     /// * `_env` - The Soroban environment for blockchain operations
     /// * `admin` - Address of the market administrator
     /// * `question` - The prediction question (1-500 characters)
-    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum 10)
+    /// * `outcomes` - Vector of possible outcomes (minimum 2, maximum
+    ///   [`OutcomeCapManager::get_max_outcomes`], default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `duration_days` - Market duration in days (1-365 days)
     /// * `asset_symbol` - Specific asset symbol (e.g., "BTC", "ETH", "GOLD")
     /// * `threshold` - Price threshold for comparison (in asset's base units)
@@ -401,6 +411,111 @@ impl MarketCreator {
 /// This struct provides comprehensive validation functions for market creation,
 /// voting operations, and state transitions. All validation functions follow
 /// strict business rules to maintain platform integrity and user experience.
+// ===== OUTCOME COUNT LIMITS =====
+
+/// Default cap on the number of outcomes a market may declare.
+///
+/// This is the value the contract used to hard-code. It is now only the
+/// fallback used until governance calls
+/// [`OutcomeCapManager::set_max_outcomes`], so the effective cap can move
+/// without a contract upgrade.
+pub const DEFAULT_MAX_OUTCOMES_PER_MARKET: u32 = 10;
+
+/// Smallest cap an admin may configure.
+///
+/// A market needs at least two mutually exclusive outcomes for resolution and
+/// payout accounting to mean anything, so the cap can never go below two.
+pub const MIN_OUTCOMES_PER_MARKET: u32 = 2;
+
+/// Largest cap an admin may configure.
+///
+/// Resolution, disputed resolution and claiming all iterate the outcome list
+/// (`resolve_market`, `resolve_market_multiple`, `claim_winnings`). Bounding
+/// the configured cap keeps a single resolution inside the ledger's
+/// instruction budget and keeps the per-market record small, so a mistyped
+/// (or compromised) admin key cannot create markets that are too expensive to
+/// resolve.
+pub const MAX_OUTCOMES_PER_MARKET_CEILING: u32 = 20;
+
+/// Manages the runtime-configurable cap on outcomes per market.
+///
+/// The cap replaces the previously hard-coded `10` with a value stored in
+/// persistent storage under [`DataKey::MaxOutcomesPerMarket`], so governance
+/// can raise or lower it without redeploying the contract.
+pub struct OutcomeCapManager;
+
+impl OutcomeCapManager {
+    /// Returns the configured maximum number of outcomes per market.
+    ///
+    /// Falls back to [`DEFAULT_MAX_OUTCOMES_PER_MARKET`] when the admin has
+    /// never configured a cap, so existing behaviour is unchanged.
+    pub fn get_max_outcomes(env: &Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get::<DataKey, u32>(&DataKey::MaxOutcomesPerMarket)
+            .unwrap_or(DEFAULT_MAX_OUTCOMES_PER_MARKET)
+    }
+
+    /// Stores a new cap on outcomes per market (admin only).
+    ///
+    /// # Parameters
+    ///
+    /// * `env` - The Soroban environment
+    /// * `caller` - The admin address; must authorize the call
+    /// * `max_outcomes` - The new cap, between [`MIN_OUTCOMES_PER_MARKET`] and
+    ///   [`MAX_OUTCOMES_PER_MARKET_CEILING`] inclusive
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::Unauthorized`] - `caller` is not the stored primary admin
+    /// * [`Error::InvalidInput`] - `max_outcomes` is outside the allowed range
+    ///
+    /// # Effects
+    ///
+    /// The cap applies to markets created after the call. Markets that already
+    /// exist keep their outcomes: lowering the cap must never invalidate a live
+    /// market, otherwise its bets could never be resolved.
+    pub fn set_max_outcomes(env: &Env, caller: &Address, max_outcomes: u32) -> Result<(), Error> {
+        // Admin authorization is enforced by the `set_max_outcomes_per_market`
+        // entrypoint; requiring auth here as well keeps the manager safe if it
+        // is ever called from another path.
+        caller.require_auth();
+
+        if max_outcomes < MIN_OUTCOMES_PER_MARKET || max_outcomes > MAX_OUTCOMES_PER_MARKET_CEILING {
+            return Err(Error::InvalidInput);
+        }
+
+        let key = DataKey::MaxOutcomesPerMarket;
+        env.storage().persistent().set(&key, &max_outcomes);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MARKET_TTL_LEDGERS, MARKET_TTL_LEDGERS);
+
+        EventEmitter::emit_max_outcomes_per_market_set(env, caller, max_outcomes);
+
+        Ok(())
+    }
+
+    /// Rejects an outcome list that violates the configured cap.
+    ///
+    /// # Errors
+    ///
+    /// * [`Error::InvalidOutcomes`] - fewer than [`MIN_OUTCOMES_PER_MARKET`] outcomes
+    /// * [`Error::TooManyOutcomes`] - more than [`OutcomeCapManager::get_max_outcomes`] outcomes
+    pub fn validate_outcome_count(env: &Env, outcomes: &Vec<String>) -> Result<(), Error> {
+        let count = outcomes.len();
+
+        if count < MIN_OUTCOMES_PER_MARKET {
+            return Err(Error::InvalidOutcomes);
+        }
+        if count > Self::get_max_outcomes(env) {
+            return Err(Error::TooManyOutcomes);
+        }
+
+        Ok(())
+    }
+}
+
 pub struct MarketValidator;
 
 impl MarketValidator {
@@ -425,13 +540,16 @@ impl MarketValidator {
     /// # Errors
     ///
     /// * `Error::InvalidQuestion` - Question is empty or exceeds 500 characters
-    /// * `Error::InvalidOutcomes` - Less than 2 outcomes, more than 10 outcomes, or empty outcome strings
+    /// * `Error::InvalidOutcomes` - Less than 2 outcomes, or empty outcome strings
+    /// * `Error::TooManyOutcomes` - More outcomes than [`OutcomeCapManager::get_max_outcomes`]
+    ///   allows (default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * `Error::InvalidDuration` - Duration is 0 or exceeds 365 days
     ///
     /// # Validation Rules
     ///
     /// * Question: Must be non-empty and between 1-500 characters
-    /// * Outcomes: Must have 2-10 unique, non-empty outcome strings
+    /// * Outcomes: Must have at least 2 unique, non-empty outcome strings, and no
+    ///   more than the admin-configured cap (default [`DEFAULT_MAX_OUTCOMES_PER_MARKET`])
     /// * Duration: Must be between 1-365 days inclusive
     ///
     /// # Example
@@ -470,12 +588,28 @@ impl MarketValidator {
         outcomes: &Vec<String>,
         duration_days: u32,
     ) -> Result<(), Error> {
+        Self::validate_unique_outcomes(outcomes)?;
+        // Outcome-count enforcement is owned by `OutcomeCapManager` so the cap
+        // stays a single admin-configurable parameter instead of a constant
+        // duplicated across validators.
+        OutcomeCapManager::validate_outcome_count(env, outcomes)?;
         crate::validation::CreationValidator::validate_market_creation(
             env,
             question,
             outcomes,
             &duration_days,
         )
+    }
+
+    /// Reject repeated outcome labels before they can make resolution ambiguous.
+    pub fn validate_unique_outcomes(outcomes: &Vec<String>) -> Result<(), Error> {
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if outcomes.iter().skip(index + 1).any(|next| next == outcome) {
+                return Err(Error::InvalidOutcomes);
+            }
+        }
+
+        Ok(())
     }
 
     /// Validates oracle configuration for market creation.
@@ -496,8 +630,9 @@ impl MarketValidator {
     ///
     /// # Errors
     ///
-    /// * `Error::InvalidOracleConfig` - Invalid provider, feed ID, or comparison operator
-    /// * `Error::InvalidThreshold` - Threshold value is out of acceptable range
+    /// * `Error::InvalidThreshold` - Threshold is zero or negative
+    /// * `Error::InvalidOracleFeed` - Feed ID is empty
+    /// * `Error::InvalidComparison` - Comparison operator is empty
     ///
     /// # Example
     ///
@@ -516,25 +651,8 @@ impl MarketValidator {
     ///
     /// assert!(MarketValidator::validate_oracle_config(&env, &oracle_config).is_ok());
     /// ```
-    pub fn validate_oracle_config(_env: &Env, oracle_config: &OracleConfig) -> Result<(), Error> {
-        // Minimal validation to match existing tests
-
-        // threshold must be positive
-        if oracle_config.threshold <= 0 {
-            return Err(Error::InvalidOracleConfig);
-        }
-
-        // feed_id must not be empty
-        if oracle_config.feed_id.len() == 0 {
-            return Err(Error::InvalidOracleConfig);
-        }
-
-        // comparison must not be empty
-        if oracle_config.comparison.len() == 0 {
-            return Err(Error::InvalidOracleConfig);
-        }
-
-        Ok(())
+    pub fn validate_oracle_config(env: &Env, oracle_config: &OracleConfig) -> Result<(), Error> {
+        oracle_config.validate(env)
     }
 
     /// Validates that a market is in the correct state to accept votes.
@@ -1082,6 +1200,84 @@ impl MarketStateManager {
             &new_description,
             &market.admin,
         );
+        Ok(())
+    }
+
+    /// Updates a market's question text before any stake has been committed.
+    ///
+    /// Market creators regularly publish a market with a typo. Because the
+    /// question is part of the market's public metadata commitment it must be
+    /// frozen as soon as real value is at risk: allowing edits after the first
+    /// stake would let a creator move the goalposts after observing bets.
+    ///
+    /// # Rules
+    ///
+    /// - `creator` must be the market creator (`market.admin`).
+    /// - The market must still be `Active` and its `end_time` must not have passed.
+    /// - `total_staked` must be exactly zero, and neither `votes` nor `stakes`
+    ///   may contain entries.
+    /// - The new question must be non-empty and at most [`MAX_QUESTION_LENGTH`]
+    ///   bytes long.
+    ///
+    /// # Effects
+    ///
+    /// - Rewrites `question` and refreshes `metadata_commitment`, so clients
+    ///   holding the previous commitment fail `verify_market_metadata` and
+    ///   re-read the market.
+    /// - Emits [`crate::events::MarketDescriptionUpdatedEvent`] carrying the old
+    ///   and new question text (the question is the market's description).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::MarketNotFound`] — no market exists for `market_id`
+    /// - [`Error::Unauthorized`] — `creator` is not the market creator
+    /// - [`Error::InvalidQuestion`] — the new question is empty
+    /// - [`Error::QuestionTooLong`] — the new question exceeds [`MAX_QUESTION_LENGTH`]
+    /// - [`Error::InvalidState`] — market is not `Active`, or a stake/vote exists
+    /// - [`Error::MarketClosed`] — `end_time` has already passed
+    pub fn update_question(
+        env: &Env,
+        market_id: &Symbol,
+        creator: &Address,
+        new_question: String,
+    ) -> Result<(), Error> {
+        if new_question.is_empty() {
+            return Err(Error::InvalidQuestion);
+        }
+        if new_question.len() > MAX_QUESTION_LENGTH {
+            return Err(Error::QuestionTooLong);
+        }
+
+        let mut market = Self::get_market(env, market_id)?;
+
+        if market.admin != *creator {
+            return Err(Error::Unauthorized);
+        }
+        if market.state != MarketState::Active {
+            return Err(Error::InvalidState);
+        }
+        if env.ledger().timestamp() >= market.end_time {
+            return Err(Error::MarketClosed);
+        }
+        // Stake gate: once anyone has committed funds the question is frozen,
+        // so no participant can have acted on text that later changes.
+        if market.total_staked != 0 || !market.votes.is_empty() || !market.stakes.is_empty() {
+            return Err(Error::InvalidState);
+        }
+
+        let old_question = market.question.clone();
+        market.question = new_question.clone();
+        market.refresh_metadata_commitment(env);
+        Self::update_market(env, market_id, &market);
+
+        EventEmitter::emit_market_description_updated(
+            env,
+            market_id,
+            &old_question,
+            &new_question,
+            creator,
+        );
+
         Ok(())
     }
 
@@ -1878,34 +2074,59 @@ impl MarketAnalytics {
     /// }
     /// ```
     pub fn calculate_community_consensus(market: &Market) -> CommunityConsensus {
-        let mut vote_counts: Map<String, u32> = Map::new(&market.votes.env());
+        // Stake-weighted quorum: weight each vote by the voter's stake so that
+        // economic exposure drives consensus rather than a raw head-count.
+        // A single whale with a large stake correctly outweighs many
+        // low-stake addresses (Issue #031).
+        let env = market.votes.env();
+        let mut stake_totals: Map<String, i128> = Map::new(&env);
 
-        for (_, outcome) in market.votes.iter() {
-            let count = vote_counts.get(outcome.clone()).unwrap_or(0);
-            vote_counts.set(outcome.clone(), count + 1);
+        for (user, outcome) in market.votes.iter() {
+            let stake = market.stakes.get(user).unwrap_or(0);
+            let current = stake_totals.get(outcome.clone()).unwrap_or(0);
+            stake_totals.set(outcome.clone(), current + stake);
         }
 
-        let mut consensus_outcome = String::from_str(&market.votes.env(), "");
-        let mut max_votes = 0;
-        let mut total_votes = 0;
+        let mut consensus_outcome = String::from_str(&env, "");
+        let mut max_stake: i128 = 0;
+        let mut total_stake: i128 = 0;
+        let total_votes = market.votes.len() as u32;
 
-        for (outcome, count) in vote_counts.iter() {
-            total_votes += count;
-            if count > max_votes {
-                max_votes = count;
+        for (outcome, stake) in stake_totals.iter() {
+            total_stake += stake;
+            if stake > max_stake {
+                max_stake = stake;
                 consensus_outcome = outcome.clone();
             }
         }
 
-        let consensus_percentage = if total_votes > 0 {
-            (max_votes * 100) / total_votes
+        // `percentage` represents the fraction of total staked weight behind
+        // the leading outcome (0–100).
+        let consensus_percentage: i128 = if total_stake > 0 {
+            (max_stake * 100) / total_stake
+        } else {
+            0
+        };
+
+        // `votes` is kept as the *count* of addresses that voted for the
+        // leading outcome for backward-compatible display; the decisive metric
+        // is now `percentage` which is stake-weighted.
+        let leading_vote_count = if total_stake > 0 {
+            let mut count: u32 = 0;
+            for (user, outcome) in market.votes.iter() {
+                if outcome == consensus_outcome {
+                    let _ = user; // used only for iteration
+                    count += 1;
+                }
+            }
+            count
         } else {
             0
         };
 
         CommunityConsensus {
             outcome: consensus_outcome,
-            votes: max_votes,
+            votes: leading_vote_count,
             total_votes,
             percentage: consensus_percentage,
         }
@@ -2706,7 +2927,8 @@ impl MarketTestHelpers {
     ///
     /// Same as `MarketCreator::create_market`, including:
     /// * `Error::InsufficientBalance` - Test admin lacks creation fee funds
-    /// * `Error::InvalidOracleConfig` - Oracle configuration issues
+    /// * `Error::InvalidThreshold` / `Error::InvalidOracleFeed` / `Error::InvalidComparison` -
+    ///   Oracle configuration issues
     ///
     /// # Prerequisites
     ///
@@ -3352,6 +3574,25 @@ mod tests {
             )
             .is_ok());
 
+            let duplicate_outcomes = vec![
+                &env,
+                String::from_str(&env, "Yes"),
+                String::from_str(&env, "Yes"),
+            ];
+            assert_eq!(
+                MarketValidator::validate_unique_outcomes(&duplicate_outcomes),
+                Err(Error::InvalidOutcomes)
+            );
+            assert_eq!(
+                MarketValidator::validate_market_params(
+                    &env,
+                    &valid_question,
+                    &duplicate_outcomes,
+                    30
+                ),
+                Err(Error::InvalidOutcomes)
+            );
+
             // Test invalid question
             let invalid_question = String::from_str(&env, "");
             assert!(MarketValidator::validate_market_params(
@@ -3587,6 +3828,128 @@ mod tests {
             // TTL should never exceed max_ttl
             assert!(effective_ttl <= max_ttl);
         });
+    }
+
+    // ── Issue #031: Stake-weighted quorum tests ──────────────────────────────
+
+    /// Helper that creates a minimal market for quorum tests.
+    fn make_quorum_market(env: &Env) -> Market {
+        Market::new(
+            env,
+            Address::generate(env),
+            String::from_str(env, "Quorum test market?"),
+            vec![
+                env,
+                String::from_str(env, "yes"),
+                String::from_str(env, "no"),
+            ],
+            env.ledger().timestamp() + 86400,
+            OracleConfig::new(
+                OracleProvider::pyth(),
+                Address::from_str(
+                    env,
+                    "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+                ),
+                String::from_str(env, "BTC/USD"),
+                2_500_000,
+                String::from_str(env, "gt"),
+            ),
+            None,
+            86400,
+            MarketState::Active,
+        )
+    }
+
+    /// A single whale (10 000 stake) should beat nine low-stake voters
+    /// (1 stake each) under stake-weighted quorum even though the whale
+    /// has fewer addresses on their side (Issue #031).
+    #[test]
+    fn test_stake_weighted_quorum_whale_beats_crowd() {
+        let env = Env::default();
+        let mut market = make_quorum_market(&env);
+
+        // One whale votes "yes" with a large stake.
+        let whale = Address::generate(&env);
+        market.add_vote(whale, String::from_str(&env, "yes"), 10_000);
+
+        // Nine low-stake voters choose "no".
+        for _ in 0..9 {
+            let voter = Address::generate(&env);
+            market.add_vote(voter, String::from_str(&env, "no"), 1);
+        }
+
+        let consensus = MarketAnalytics::calculate_community_consensus(&market);
+
+        // "yes" should win because it carries 10 000 / 10 009 ≈ 99.9% of stake.
+        assert_eq!(consensus.outcome, String::from_str(&env, "yes"),
+            "whale stake should determine the leading outcome");
+
+        // Stake-weighted percentage should be ~99, definitely > 50.
+        assert!(
+            consensus.percentage > 50,
+            "whale's outcome percentage ({}) should be a strong majority",
+            consensus.percentage
+        );
+    }
+
+    /// Under old head-count voting the crowd would win; under stake-weighted
+    /// quorum the side with the most total stake wins regardless of addresses.
+    #[test]
+    fn test_stake_weighted_quorum_equal_stake_different_counts() {
+        let env = Env::default();
+        let mut market = make_quorum_market(&env);
+
+        // Two voters on "yes" with 500 each → total 1 000.
+        for _ in 0..2 {
+            let voter = Address::generate(&env);
+            market.add_vote(voter, String::from_str(&env, "yes"), 500);
+        }
+
+        // Three voters on "no" with 100 each → total 300.
+        for _ in 0..3 {
+            let voter = Address::generate(&env);
+            market.add_vote(voter, String::from_str(&env, "no"), 100);
+        }
+
+        let consensus = MarketAnalytics::calculate_community_consensus(&market);
+
+        // "yes" has more total stake (1 000 vs 300) even though fewer addresses.
+        assert_eq!(
+            consensus.outcome,
+            String::from_str(&env, "yes"),
+            "outcome with higher total stake should win"
+        );
+
+        // percentage should be 1000*100/(1000+300) ≈ 76
+        let expected_pct = (1000_i128 * 100) / 1300;
+        assert_eq!(consensus.percentage, expected_pct);
+    }
+
+    /// With no votes, consensus should be empty and percentage 0.
+    #[test]
+    fn test_stake_weighted_quorum_empty_market() {
+        let env = Env::default();
+        let market = make_quorum_market(&env);
+        let consensus = MarketAnalytics::calculate_community_consensus(&market);
+
+        assert_eq!(consensus.total_votes, 0);
+        assert_eq!(consensus.percentage, 0);
+    }
+
+    /// A single voter should get 100% percentage.
+    #[test]
+    fn test_stake_weighted_quorum_single_voter() {
+        let env = Env::default();
+        let mut market = make_quorum_market(&env);
+
+        let voter = Address::generate(&env);
+        market.add_vote(voter, String::from_str(&env, "yes"), 5_000);
+
+        let consensus = MarketAnalytics::calculate_community_consensus(&market);
+
+        assert_eq!(consensus.outcome, String::from_str(&env, "yes"));
+        assert_eq!(consensus.percentage, 100);
+        assert_eq!(consensus.total_votes, 1);
     }
 }
 

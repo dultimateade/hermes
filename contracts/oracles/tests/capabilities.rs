@@ -6,7 +6,7 @@
 //! |---|-----------------------------------------------|-----------------------------------------------------|
 //! | 1 | `capabilities_returns_nonzero`                | Return value is non-zero                            |
 //! | 2 | `capabilities_has_expected_flags`             | Every documented flag is set                        |
-//! | 3 | `capabilities_no_reserved_bits_set`           | Bits 8-63 are all clear                             |
+//! | 3 | `capabilities_no_reserved_bits_set`           | Bits 9-63 are all clear                             |
 //! | 4 | `capabilities_is_pure_no_auth_required`       | Call succeeds without `mock_all_auths`              |
 //! | 5 | `capabilities_is_idempotent`                  | Two consecutive calls return the same value         |
 //! | 6 | `capabilities_unaffected_by_registry_state`   | Adding/removing oracles does not change the bitmap  |
@@ -17,7 +17,17 @@
 #![cfg(test)]
 
 use oracles::{CapabilityFlag, OraclesContract, OraclesContractClient};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+
+#[contract]
+pub struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    pub fn capabilities(_env: Env) -> u64 {
+        CapabilityFlag::GET_PRICE
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Fixture
@@ -82,6 +92,7 @@ fn capabilities_has_expected_flags() {
         ("PRICE_EXPONENT",      CapabilityFlag::PRICE_EXPONENT),
         ("TTL_MANAGEMENT",      CapabilityFlag::TTL_MANAGEMENT),
         ("VERSION_VIEW",        CapabilityFlag::VERSION_VIEW),
+        ("CHECK_ORACLE_HEALTH", CapabilityFlag::CHECK_ORACLE_HEALTH),
     ];
 
     for (name, flag) in required {
@@ -98,7 +109,7 @@ fn capabilities_has_expected_flags() {
 // 3. No reserved bits are set
 // ---------------------------------------------------------------------------
 
-/// Bits 8-63 are reserved for future use and must be zero in this version.
+/// Bits 9-63 are reserved for future use and must be zero in this version.
 ///
 /// A set reserved bit would be a client-visible API change that breaks any
 /// consumer performing an equality check on the whole bitmap.
@@ -106,12 +117,12 @@ fn capabilities_has_expected_flags() {
 fn capabilities_no_reserved_bits_set() {
     let f = Fx::new();
     let caps = f.client.capabilities();
-    let defined_mask: u64 = (1 << 8) - 1; // bits 0-7 only
+    let defined_mask: u64 = (1 << 9) - 1; // bits 0-8 only
 
     assert_eq!(
         caps & !defined_mask,
         0,
-        "reserved bits (8-63) must be zero; got capabilities() = {caps:#018x}"
+        "reserved bits (9-63) must be zero; got capabilities() = {caps:#018x}"
     );
 }
 
@@ -168,8 +179,8 @@ fn capabilities_unaffected_by_registry_state() {
 
     // Mutate registry state.
     let admin  = Address::generate(&f.env);
-    let oracle = Address::generate(&f.env);
-    f.client.add_oracle(&admin, &oracle);
+    let oracle = f.env.register(MockOracle, ());
+    f.client.add_oracle(&admin, &oracle).unwrap();
 
     let caps_after_add = f.client.capabilities();
     assert_eq!(
@@ -207,6 +218,7 @@ fn capabilities_bit_positions_match_flag_consts() {
     assert_eq!(caps & (1u64 << 5), CapabilityFlag::PRICE_EXPONENT,      "bit 5 = PRICE_EXPONENT");
     assert_eq!(caps & (1u64 << 6), CapabilityFlag::TTL_MANAGEMENT,      "bit 6 = TTL_MANAGEMENT");
     assert_eq!(caps & (1u64 << 7), CapabilityFlag::VERSION_VIEW,        "bit 7 = VERSION_VIEW");
+    assert_eq!(caps & (1u64 << 8), CapabilityFlag::CHECK_ORACLE_HEALTH, "bit 8 = CHECK_ORACLE_HEALTH");
 }
 
 // ---------------------------------------------------------------------------

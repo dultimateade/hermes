@@ -34,6 +34,7 @@ fn setup_test() -> (Env, TestSetup) {
         user1,
         user2,
         user3,
+        contract_id,
         client,
     };
 
@@ -48,6 +49,7 @@ struct TestSetup {
     user1: Address,
     user2: Address,
     user3: Address,
+    contract_id: Address,
     client: AllowlistContractClient,
 }
 
@@ -340,6 +342,26 @@ fn test_delete_nonexistent_allowlist() {
     assert_eq!(result, Ok(Err(AllowlistError::AllowlistNotFound)));
 }
 
+#[test]
+fn test_is_allowed_distinguishes_expired_from_missing_allowlist() {
+    let (env, setup) = setup_test();
+    let list_id = Symbol::new(&env, "expired");
+    setup.client.create_allowlist(&setup.admin, &list_id);
+    setup.client.add_address(&setup.admin, &list_id, &setup.user1);
+
+    let storage_key = (Symbol::new(&env, "Allowlist"), list_id.clone());
+    env.as_contract(&setup.contract_id, || {
+        env.storage().persistent().remove(&storage_key);
+    });
+
+    let expired = setup.client.try_is_allowed(&list_id, &setup.user1);
+    assert_eq!(expired, Ok(Err(AllowlistError::AllowlistExpired)));
+
+    let unknown_id = Symbol::new(&env, "unknown");
+    let missing = setup.client.try_is_allowed(&unknown_id, &setup.user1);
+    assert_eq!(missing, Ok(Err(AllowlistError::AllowlistNotFound)));
+}
+
 // ===== Ownership transfer tests =====
 
 #[test]
@@ -365,16 +387,35 @@ fn test_transfer_ownership_rejects_same_admin() {
 fn test_new_admin_can_manage_allowlists() {
     let (env, setup) = setup_test();
     let new_admin = Address::generate(&env);
+    let list_id = Symbol::new(&env, "existing_list");
+
+    setup
+        .client
+        .create_allowlist(&setup.admin, &list_id);
+    setup
+        .client
+        .add_address(&setup.admin, &list_id, &setup.user1);
 
     setup.client.transfer_ownership(&setup.admin, &new_admin);
 
-    let list_id = Symbol::new(&env, "new_list");
-    let result = setup.client.try_create_allowlist(&new_admin, &list_id);
-    assert!(result.is_ok());
+    let new_admin_result = setup
+        .client
+        .try_add_address(&new_admin, &list_id, &setup.user2);
+    assert_eq!(new_admin_result, Ok(Ok(())));
 
-    // Old admin should no longer be able to manage
-    let result2 = setup.client.try_create_allowlist(&setup.admin, &list_id);
-    assert!(result2.is_err());
+    let old_admin_result = setup
+        .client
+        .try_add_address(&setup.admin, &list_id, &setup.user3);
+    assert_eq!(
+        old_admin_result,
+        Ok(Err(AllowlistError::Unauthorized))
+    );
+
+    let all = setup.client.get_allowlist(&list_id);
+    assert_eq!(all.len(), 2);
+    assert!(setup.client.is_allowed(&list_id, &setup.user1));
+    assert!(setup.client.is_allowed(&list_id, &setup.user2));
+    assert!(!setup.client.is_allowed(&list_id, &setup.user3));
 }
 
 // ===== Version and utility tests =====
@@ -383,6 +424,27 @@ fn test_new_admin_can_manage_allowlists() {
 fn test_version() {
     let (_env, setup) = setup_test();
     assert_eq!(setup.client.version(), 1);
+}
+
+#[test]
+fn test_entrypoint_bumps_instance_ttl() {
+    let (env, setup) = setup_test();
+    env.ledger().set(LedgerInfo {
+        timestamp: 1735689600,
+        protocol_version: 20,
+        sequence_number: 450_000,
+        network_id: [0; 32],
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 518_400,
+    });
+
+    let ttl_before = env.as_contract(&setup.contract_id, || env.storage().instance().get_ttl());
+    assert!(ttl_before < 518_400);
+    assert_eq!(setup.client.get_admin(), setup.admin);
+    let ttl_after = env.as_contract(&setup.contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl_after, 518_400);
 }
 
 #[test]
@@ -411,4 +473,18 @@ fn test_get_nonexistent_allowlist() {
 
     let result = setup.client.try_get_allowlist(&ghost_id);
     assert_eq!(result, Ok(Err(AllowlistError::AllowlistNotFound)));
+}
+
+#[test]
+fn test_admin_persisted_in_persistent_storage() {
+    let (env, setup) = setup_test();
+
+    // Verify admin is stored and accessible
+    let stored_admin = setup.client.get_admin();
+    assert_eq!(stored_admin, setup.admin);
+
+    // Transfer ownership and verify new admin is maintained consistently
+    let new_admin = Address::generate(&env);
+    setup.client.transfer_ownership(&setup.admin, &new_admin);
+    assert_eq!(setup.client.get_admin(), new_admin);
 }

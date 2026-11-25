@@ -201,6 +201,7 @@ fn test_fetch_oracle_result_mock_all_auths_any_caller_passes_auth() {
 fn test_set_oracle_confidence_threshold_precise_admin_mock_auth_passes() {
     let (env, cid, admin) = setup();
     let _market_id = make_reflector_market(&env, &cid, &admin);
+    assert_eq!(client(&env, &cid).get_oracle_confidence_threshold(), 5_000u32);
 
     env.mock_auths(&[MockAuth {
         address: &admin,

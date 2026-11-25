@@ -21,7 +21,7 @@ use betting::events::{
     BettingEventEmitter, BettingEventSchema, BettingEventSchemaEntry, BetBatchCreatedEvent,
     BetClaimedEvent, BetCreatedEvent, BetStatsUpdatedEvent, BetStatusChangedEvent,
     EVENT_NAME_BET_BATCH_CREATED, EVENT_NAME_BET_CLAIMED, EVENT_NAME_BET_CREATED,
-    EVENT_NAME_BET_STATS_UPDATED, EVENT_NAME_BET_STATUS_CHANGED, NS_NONCE,
+    EVENT_NAME_BET_STATS_UPDATED, EVENT_NAME_BET_STATUS_CHANGED, NS_NONCE, NS_SCHEMA,
     STATUS_ACTIVE, STATUS_CANCELLED, STATUS_LOST, STATUS_REFUNDED, STATUS_WON,
     TOPIC_BET_BATCH_CREATED, TOPIC_BET_CLAIMED, TOPIC_BET_CREATED,
     TOPIC_BET_STATS_UPDATED, TOPIC_BET_STATUS_CHANGED,
@@ -142,11 +142,22 @@ fn emit_bet_created_publishes_with_frozen_topic_and_version() {
     assert_eq!(events.len(), 1, "single emit should publish exactly one event");
 
     let (_, topics, payload) = events.get(0).unwrap();
-    // Topic tuple: (TOPIC_BET_CREATED, market_id, schema_version)
-    assert_eq!(topics.len(), 3, "topic tuple must have exactly 3 elements");
+    // Topic tuple: (TOPIC_BET_CREATED, market_id).  The schema version is
+    // encoded once in the instance record, not repeated per event.
+    assert_eq!(topics.len(), 2, "topic tuple must have exactly 2 elements");
     assert_eq!(topics.get(0).unwrap(), TOPIC_BET_CREATED);
     assert_eq!(topics.get(1).unwrap(), market_id);
-    assert_eq!(topics.get(2).unwrap(), BETTING_EVENT_SCHEMA_VERSION);
+
+    let record_key = (NS_SCHEMA, Symbol::new(&env, "ver"));
+    let recorded: u32 = env.storage().instance().get(&record_key).unwrap_or(0);
+    assert_eq!(
+        recorded, BETTING_EVENT_SCHEMA_VERSION,
+        "schema version must be encoded once in the instance record"
+    );
+    assert_eq!(
+        BettingEventSchema::deployment_schema_version(&env),
+        BETTING_EVENT_SCHEMA_VERSION
+    );
 
     let event: BetCreatedEvent = payload.try_into_val().unwrap();
     assert_eq!(event.market_id, market_id);
@@ -207,7 +218,11 @@ fn emit_bet_batch_created_emits_correct_fields() {
 
     assert_eq!(topics.get(0).unwrap(), TOPIC_BET_BATCH_CREATED);
     assert_eq!(topics.get(1).unwrap(), bettor);
-    assert_eq!(topics.get(2).unwrap(), BETTING_EVENT_SCHEMA_VERSION);
+    assert_eq!(
+        topics.len(),
+        2,
+        "the schema version must not be repeated in every event"
+    );
 
     let event: BetBatchCreatedEvent = payload.try_into_val().unwrap();
     assert_eq!(event.bettor, bettor);
@@ -307,7 +322,11 @@ fn emit_bet_claimed_carries_gross_fee_and_net() {
     let (_, topics, payload) = events.get(0).unwrap();
     assert_eq!(topics.get(0).unwrap(), TOPIC_BET_CLAIMED);
     assert_eq!(topics.get(1).unwrap(), user);
-    assert_eq!(topics.get(2).unwrap(), BETTING_EVENT_SCHEMA_VERSION);
+    assert_eq!(
+        topics.len(),
+        2,
+        "the schema version must not be repeated in every event"
+    );
 
     let event: BetClaimedEvent = payload.try_into_val().unwrap();
     assert_eq!(event.market_id, market_id);
@@ -342,7 +361,11 @@ fn emit_bet_stats_updated_carries_aggregate_snapshot() {
     let (_, topics, payload) = events.get(0).unwrap();
     assert_eq!(topics.get(0).unwrap(), TOPIC_BET_STATS_UPDATED);
     assert_eq!(topics.get(1).unwrap(), market_id);
-    assert_eq!(topics.get(2).unwrap(), BETTING_EVENT_SCHEMA_VERSION);
+    assert_eq!(
+        topics.len(),
+        2,
+        "the schema version must not be repeated in every event"
+    );
 
     let event: BetStatsUpdatedEvent = payload.try_into_val().unwrap();
     assert_eq!(event.market_id, market_id);
@@ -437,6 +460,81 @@ fn schema_version_is_frozen_at_one() {
     let env = env();
     let entry = BettingEventSchema::get_schema(&env, EVENT_NAME_BET_CREATED).unwrap();
     assert_eq!(entry.schema_version, 1u32);
+}
+
+/// The deployment-wide schema version is written to the contract instance
+/// record exactly once (lazily, on the first emit) and read back for every
+/// later emit instead of being repeated inside each event.
+#[test]
+fn schema_version_is_encoded_once_in_the_instance_record() {
+    let env = env();
+    let market_id = new_market_id(&env, "mkt_rec");
+    let bettor = bettor(&env);
+    let outcome = String::from_str(&env, "yes");
+
+    let key = (NS_SCHEMA, Symbol::new(&env, "ver"));
+    assert!(
+        env.storage().instance().get::<(Symbol, Symbol), u32>(&key).is_none(),
+        "no schema record may exist before the first emit"
+    );
+
+    BettingEventEmitter::emit_bet_created(&env, &market_id, &bettor, &outcome, 1, 0);
+    assert_eq!(
+        env.storage().instance().get::<(Symbol, Symbol), u32>(&key),
+        Some(BETTING_EVENT_SCHEMA_VERSION),
+        "the first emit must encode the version in the instance record"
+    );
+
+    // A second emit reuses the stored record — the value is not rewritten
+    // with anything else, so the record stays the single source of truth.
+    BettingEventEmitter::emit_bet_created(&env, &market_id, &bettor, &outcome, 1, 0);
+    assert_eq!(
+        env.storage().instance().get::<(Symbol, Symbol), u32>(&key),
+        Some(BETTING_EVENT_SCHEMA_VERSION)
+    );
+    assert_eq!(
+        BettingEventSchema::deployment_schema_version(&env),
+        BETTING_EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        BettingEventSchema::schema_record_key(),
+        key,
+        "the public key helper must match the key used by the emitters"
+    );
+}
+
+/// None of the five emitters may repeat the schema version in its topic
+/// tuple: the tuple is `(topic, id)` only.
+#[test]
+fn no_emitter_repeats_the_schema_version_in_its_topics() {
+    let env = env();
+    let market_id = new_market_id(&env, "mkt_topics");
+    let user = bettor(&env);
+    let outcome = String::from_str(&env, "yes");
+    let mids = vec![&env, market_id.clone()];
+
+    BettingEventEmitter::emit_bet_created(&env, &market_id, &user, &outcome, 1, 0);
+    BettingEventEmitter::emit_bet_batch_created(&env, &user, &mids, 1);
+    BettingEventEmitter::emit_bet_status_changed(
+        &env,
+        &market_id,
+        &user,
+        STATUS_ACTIVE,
+        STATUS_WON,
+        None,
+    );
+    BettingEventEmitter::emit_bet_claimed(&env, &market_id, &user, 1, 0, 1);
+    BettingEventEmitter::emit_bet_stats_updated(&env, &market_id, 1, 1, 1);
+
+    let events = env.events().all();
+    assert_eq!(events.len(), 5, "one event per emitter");
+    for (_, topics, _) in events.iter() {
+        assert_eq!(
+            topics.len(),
+            2,
+            "topic tuples must stay at 2 elements; the schema version lives in the instance record"
+        );
+    }
 }
 
 // -----------------------------------------------------------------

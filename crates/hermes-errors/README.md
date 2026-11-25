@@ -51,7 +51,7 @@ Three layers ensure single-source-of-truth:
 
 ### For End Users (Contract Developers)
 
-See `CONTRIBUTING_ERRORS.md` for the workflow of adding/modifying errors.
+See [CONTRIBUTING_ERRORS.md](../../docs/impl/CONTRIBUTING_ERRORS.md) for the workflow of adding/modifying errors.
 
 TL;DR to add a new error:
 
@@ -72,11 +72,15 @@ cargo build                   # Regenerate contract files
 
 1. Registry is already defined in `src/lib.rs`
 2. Code generation is in `crates/hermes-codegen/`
-3. Migrate contracts one at a time using `MIGRATION_ERROR_SYNC.md`
+3. Migrate contracts one at a time using [MIGRATION_ERROR_SYNC.md](../../docs/impl/MIGRATION_ERROR_SYNC.md)
 
 ## Code Ranges
 
-Each contract reserves a 100-code block:
+Error codes are limited to the range `0–9999`. `MAX_ERROR_CODE` is
+`9999`; `ErrorDefinition::new()` rejects values above this limit so that
+future additions cannot occupy an unbounded code space.
+
+The allocation strategy reserves each contract a 100-code block:
 
 | Contract   | Block    | Ranges                        |
 |------------|----------|-------------------------------|
@@ -219,7 +223,7 @@ For existing contracts not yet using the registry:
 5. Regenerate error files
 6. Test and commit
 
-See `MIGRATION_ERROR_SYNC.md` for detailed steps.
+See [MIGRATION_ERROR_SYNC.md](../../docs/impl/MIGRATION_ERROR_SYNC.md) for detailed steps.
 
 ## Future Enhancements
 
@@ -232,7 +236,7 @@ See `MIGRATION_ERROR_SYNC.md` for detailed steps.
 
 ## Contributing
 
-1. Read `CONTRIBUTING_ERRORS.md`
+1. Read [CONTRIBUTING_ERRORS.md](../../docs/impl/CONTRIBUTING_ERRORS.md)
 2. Edit `src/lib.rs` with new error definitions
 3. Run `cargo test`
 4. Rebuild affected contracts
@@ -245,6 +249,6 @@ Same as Hermes project.
 ## Questions?
 
 See:
-- `ERROR_DOCS_SYNC.md` — Overall architecture and benefits
-- `MIGRATION_ERROR_SYNC.md` — Step-by-step migration guide
-- `CONTRIBUTING_ERRORS.md` — Adding/modifying errors
+- [ERROR_DOCS_SYNC.md](../../docs/impl/ERROR_DOCS_SYNC.md) — Overall architecture and benefits
+- [MIGRATION_ERROR_SYNC.md](../../docs/impl/MIGRATION_ERROR_SYNC.md) — Step-by-step migration guide
+- [CONTRIBUTING_ERRORS.md](../../docs/impl/CONTRIBUTING_ERRORS.md) — Adding/modifying errors
