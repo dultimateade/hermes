@@ -37,6 +37,43 @@ jobs:
               )
           print(f"Verified active Rust toolchain: {active} (configured: {expected})")
           PY
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        run: |
+          cargo audit --json > cargo-audit-report.json || true
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report = json.loads(Path("cargo-audit-report.json").read_text() or "{}")
+          blocking = {"critical", "high"}
+          failures = []
+
+          for entry in report.get("vulnerabilities", {}).get("list", []):
+              advisory = entry.get("advisory", {})
+              severity = str(advisory.get("severity") or "").lower()
+              if severity in blocking:
+                  package = entry.get("package", {})
+                  failures.append(
+                      f"{advisory.get('id', 'unknown')} ({severity}) in "
+                      f"{package.get('name', '?')} {package.get('version', '?')}: "
+                      f"{advisory.get('title', '')}"
+                  )
+
+          if failures:
+              print("Blocking advisories detected:")
+              for failure in failures:
+                  print(f"  - {failure}")
+              sys.exit(1)
+
+          print("No CRITICAL or HIGH severity advisories detected.")
+          PY
       - name: Run workspace tests
         run: cargo test --workspace
       - name: Verify committed snapshot goldens

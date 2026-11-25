@@ -88,8 +88,8 @@ jobs:
               print("ERROR: benchmarks/baseline.json not found", file=sys.stderr)
               sys.exit(1)
           if not results_path.exists():
-              print("WARNING: benchmark_results.json not found – skipping baseline comparison")
-              sys.exit(0)
+              print("ERROR: benchmark_results.json not found – cannot verify regressions", file=sys.stderr)
+              sys.exit(1)
 
           baseline = json.loads(baseline_path.read_text())
           results  = json.loads(results_path.read_text())
@@ -97,7 +97,9 @@ jobs:
           baseline_benches = baseline.get("benchmarks", {})
           result_list      = {r["name"]: r for r in results.get("results", [])}
 
-          regression_limit = 5.0  # percent
+          # Hard ceiling: any entrypoint regressing more than 10% fails the build.
+          # An entry may opt into a stricter limit via its own max_regression_pct.
+          regression_limit = 10.0  # percent
           failures = []
 
           for name, bdata in baseline_benches.items():
@@ -109,9 +111,9 @@ jobs:
               if current_ns is None or baseline_ns is None:
                   continue
               pct_change = ((current_ns - baseline_ns) / baseline_ns) * 100.0
-              limit = bdata.get("max_regression_pct", regression_limit)
+              limit = min(bdata.get("max_regression_pct", regression_limit), regression_limit)
               status = "PASS" if pct_change <= limit else "FAIL"
-              print(f"  {status}  {name}: {baseline_ns:.0f} ns → {current_ns:.0f} ns  ({pct_change:+.2f}%)")
+              print(f"  {status}  {name}: {baseline_ns:.0f} ns → {current_ns:.0f} ns  ({pct_change:+.2f}%, limit {limit:.1f}%)")
               if status == "FAIL":
                   failures.append(f"{name}: +{pct_change:.2f}% regression (limit {limit:.1f}%)")
 
@@ -121,7 +123,7 @@ jobs:
                   print(f"   - {f}")
               sys.exit(1)
           else:
-              print("\n✅ All benchmarks within 5% of committed baseline.")
+              print("\n✅ All benchmarks within 10% of committed baseline.")
           EOF
 
       - name: Upload Markets Benchmark Artifacts

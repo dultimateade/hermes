@@ -53,6 +53,17 @@ def parse_args():
         default="benchmark_results.json",
         help="Path to write JSON benchmark summary",
     )
+    parser.add_argument(
+        "--baseline-json",
+        default="benchmarks/baseline.json",
+        help="Path to baseline JSON file for regression comparison",
+    )
+    parser.add_argument(
+        "--max-regression-pct",
+        type=float,
+        default=10.0,
+        help="Maximum allowed regression percentage vs baseline (default: 10.0)",
+    )
     return parser.parse_args()
 
 
@@ -201,6 +212,100 @@ def find_benchmark_results(criterion_dir: Path) -> dict:
     return results
 
 
+def load_baseline(baseline_path: str) -> dict:
+    """Load baseline benchmark data from JSON file.
+
+    Returns the ``benchmarks`` map from the baseline file, or an empty dict if
+    the file is missing or malformed.
+    """
+    path = Path(baseline_path)
+    if not path.exists():
+        print(
+            f"Warning: Baseline file '{baseline_path}' not found. Skipping baseline comparison.",
+            file=sys.stderr,
+        )
+        return {}
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed reading baseline '{baseline_path}': {e}", file=sys.stderr)
+        return {}
+
+    benchmarks = data.get("benchmarks", {})
+    if not isinstance(benchmarks, dict):
+        print(
+            f"Warning: Baseline '{baseline_path}' has no valid 'benchmarks' map. "
+            "Skipping baseline comparison.",
+            file=sys.stderr,
+        )
+        return {}
+
+    return benchmarks
+
+
+def compare_to_baseline(
+    benchmarks: dict, baseline: dict, default_max_regression_pct: float
+) -> tuple:
+    """Compare current benchmark results against the baseline.
+
+    Returns a tuple of (comparisons, has_regressions) where comparisons is a
+    list of per-entrypoint dicts describing the comparison outcome.
+    """
+    comparisons = []
+    has_regressions = False
+
+    for name, base in baseline.items():
+        base_mean = base.get("mean_ns") if isinstance(base, dict) else None
+        current = benchmarks.get(name)
+        current_mean = current.get("mean_ns") if current else None
+
+        max_reg_pct = default_max_regression_pct
+        if isinstance(base, dict) and base.get("max_regression_pct") is not None:
+            max_reg_pct = base["max_regression_pct"]
+
+        if base_mean is None or current_mean is None:
+            comparisons.append({
+                "name": name,
+                "baseline_ns": base_mean,
+                "current_ns": current_mean,
+                "change_pct": None,
+                "max_reg_pct": max_reg_pct,
+                "status": "SKIPPED",
+                "reason": "Missing baseline or current measurement",
+            })
+            continue
+
+        if base_mean > 0:
+            change_pct = ((current_mean - base_mean) / base_mean) * 100.0
+        else:
+            change_pct = 0.0 if current_mean == 0 else float("inf")
+
+        if change_pct > max_reg_pct:
+            status = "FAILED"
+            has_regressions = True
+            reason = (
+                f"Regression of +{change_pct:.2f}% exceeded baseline limit of "
+                f"+{max_reg_pct:.2f}%"
+            )
+        else:
+            status = "PASSED"
+            reason = f"Within baseline limit of +{max_reg_pct:.2f}%"
+
+        comparisons.append({
+            "name": name,
+            "baseline_ns": base_mean,
+            "current_ns": current_mean,
+            "change_pct": change_pct,
+            "max_reg_pct": max_reg_pct,
+            "status": status,
+            "reason": reason,
+        })
+
+    return comparisons, has_regressions
+
+
 def evaluate_benchmarks(benchmarks: dict, config: dict) -> tuple:
     """Evaluate benchmark results against thresholds."""
     thresholds = config.get("thresholds", {})
@@ -250,14 +355,25 @@ def evaluate_benchmarks(benchmarks: dict, config: dict) -> tuple:
     return evaluations, has_regressions
 
 
-def generate_reports(evaluations: list, has_regressions: bool, report_md_path: str, report_json_path: str, contract: str):
+def generate_reports(
+    evaluations: list,
+    has_regressions: bool,
+    report_md_path: str,
+    report_json_path: str,
+    contract: str,
+    baseline_comparisons: list = None,
+):
     """Write markdown and JSON reports."""
+    if baseline_comparisons is None:
+        baseline_comparisons = []
+
     # Write JSON report
     with open(report_json_path, "w", encoding="utf-8") as f:
         json.dump({
             "contract": contract,
             "has_regressions": has_regressions,
             "results": evaluations,
+            "baseline_comparisons": baseline_comparisons,
         }, f, indent=2)
 
     # Build Markdown report
@@ -279,6 +395,37 @@ def generate_reports(evaluations: list, has_regressions: bool, report_md_path: s
 
         lines.append(f"| `{name}` | {mean_str} | {limit_str} | {change_str} | {status_icon} |")
 
+    if baseline_comparisons:
+        lines.append("")
+        lines.append("### 📊 Baseline Comparison")
+        lines.append("")
+        lines.append("| Entrypoint | Baseline (Mean) | Current (Mean) | Change | Limit | Status |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for item in baseline_comparisons:
+            base_str = (
+                format_duration(item["baseline_ns"])
+                if item["baseline_ns"] is not None
+                else "N/A"
+            )
+            cur_str = (
+                format_duration(item["current_ns"])
+                if item["current_ns"] is not None
+                else "N/A"
+            )
+            change_str = (
+                f"{item['change_pct']:+.2f}%"
+                if item["change_pct"] is not None
+                else "N/A"
+            )
+            limit_str = f"+{item['max_reg_pct']:.2f}%"
+            status_icon = "✅ PASS" if item["status"] == "PASSED" else (
+                "❌ FAIL" if item["status"] == "FAILED" else "⚠️ SKIP"
+            )
+            lines.append(
+                f"| `{item['name']}` | {base_str} | {cur_str} | {change_str} | "
+                f"{limit_str} | {status_icon} |"
+            )
+
     if has_regressions:
         lines.append("")
         lines.append("### ⚠️ Regression Details")
@@ -287,6 +434,10 @@ def generate_reports(evaluations: list, has_regressions: bool, report_md_path: s
                 lines.append(f"- **`{item['name']}`**:")
                 for r in item["reasons"]:
                     lines.append(f"  - {r}")
+        for item in baseline_comparisons:
+            if item["status"] == "FAILED":
+                lines.append(f"- **`{item['name']}`** (baseline):")
+                lines.append(f"  - {item['reason']}")
 
     md_content = "\n".join(lines) + "\n"
 
@@ -322,6 +473,28 @@ def main():
     config = load_thresholds(args.thresholds)
     evaluations, has_regressions = evaluate_benchmarks(benchmarks, config)
 
+    baseline = load_baseline(args.baseline_json)
+    baseline_comparisons, baseline_regressions = compare_to_baseline(
+        benchmarks, baseline, args.max_regression_pct
+    )
+    for item in baseline_comparisons:
+        if item["status"] == "PASSED":
+            print(
+                f"✅ PASS {item['name']}: {item['change_pct']:+.2f}% "
+                f"(limit +{item['max_reg_pct']:.2f}%)"
+            )
+        elif item["status"] == "FAILED":
+            print(
+                f"❌ FAIL {item['name']}: {item['change_pct']:+.2f}% "
+                f"(limit +{item['max_reg_pct']:.2f}%)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"⚠️ SKIP {item['name']}: {item['reason']}", file=sys.stderr)
+
+    if baseline_regressions:
+        has_regressions = True
+
     missing_entrypoints = check_entrypoint_coverage(args.contract, config)
     if missing_entrypoints:
         print(
@@ -337,7 +510,14 @@ def main():
         )
         has_regressions = True
 
-    generate_reports(evaluations, has_regressions, args.report_md, args.report_json, args.contract)
+    generate_reports(
+        evaluations,
+        has_regressions,
+        args.report_md,
+        args.report_json,
+        args.contract,
+        baseline_comparisons,
+    )
 
     if has_regressions:
         print("\n❌ Performance regression detected! CI benchmark check failed.", file=sys.stderr)
