@@ -173,3 +173,54 @@ fn state_not_changed_on_invalid_target() {
     let _ = f.client.try_migrate_error_data(&f.admin, &4, &1);
     assert_eq!(f.client.current_version(), 4);
 }
+
+// ---------------------------------------------------------------------------
+// Happy path: Comprehensive state verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn migration_preserves_admin_and_updates_version() {
+    let f = Fixture::new(1);
+
+    assert_eq!(f.client.admin(), Ok(f.admin.clone()), "admin should be set");
+    assert_eq!(f.client.current_version(), 1, "initial version should be 1");
+
+    // Perform migration
+    assert_eq!(
+        f.client.try_migrate_error_data(&f.admin, &1, &3),
+        Ok(Ok(())),
+        "migration from 1→3 should succeed"
+    );
+
+    // Verify post-migration state
+    assert_eq!(
+        f.client.current_version(),
+        3,
+        "stored version must be updated to 3"
+    );
+    assert_eq!(
+        f.client.admin(),
+        Ok(f.admin.clone()),
+        "admin must remain unchanged after migration"
+    );
+}
+
+#[test]
+fn multiple_sequential_migrations_preserve_invariants() {
+    let f = Fixture::new(1);
+
+    // First migration: 1 → 2
+    assert_eq!(f.client.try_migrate_error_data(&f.admin, &1, &2), Ok(Ok(())));
+    assert_eq!(f.client.current_version(), 2);
+    assert_eq!(f.client.admin(), Ok(f.admin.clone()));
+
+    // Second migration: 2 → 3
+    assert_eq!(f.client.try_migrate_error_data(&f.admin, &2, &3), Ok(Ok(())));
+    assert_eq!(f.client.current_version(), 3);
+    assert_eq!(f.client.admin(), Ok(f.admin.clone()));
+
+    // Third migration: 3 → 5
+    assert_eq!(f.client.try_migrate_error_data(&f.admin, &3, &5), Ok(Ok(())));
+    assert_eq!(f.client.current_version(), 5);
+    assert_eq!(f.client.admin(), Ok(f.admin.clone()));
+}
