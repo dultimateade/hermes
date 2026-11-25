@@ -26,6 +26,8 @@
 //! | `unpause_markets`           | Admin                      |
 //! | `set_market_limit`          | Admin                      |
 //! | `get_market_limit`          | Anyone (read-only)          |
+//! | `set_creator_market_limit`  | Admin                      |
+//! | `get_creator_market_limit`  | Anyone (read-only)          |
 //! | `propose_pause`             | Admin                      |
 //! | `approve_pause`             | Admin                      |
 //! | `execute_pause`             | Admin                      |
@@ -58,6 +60,7 @@ pub use errors::ContractError;
 pub type Error = ContractError;
 
 const DEFAULT_MAX_MARKET_COUNT: u32 = 10_000;
+const DEFAULT_MAX_MARKETS_PER_CREATOR: u32 = 100;
 const MAX_ADMIN_LIST_SIZE: u32 = 20;
 
 /// TTL extension for payout curve entries (≈ 1 year at ~5s/ledger).
@@ -145,6 +148,11 @@ pub enum DataKey {
     // ── Issue #343: Deadline Grace Period ───────────────────────────
     /// Maximum number of seconds a market deadline may be shortened.
     DeadlineGracePeriodSeconds,
+
+    /// Maximum number of markets a single creator may create.
+    CreatorMarketLimit,
+    /// Number of markets created by a specific address.
+    CreatorMarketCounter(Address),
 }
 
 /// On-chain representation of a prediction market.
@@ -879,6 +887,14 @@ impl MarketsContract {
             .unwrap_or(DEFAULT_MAX_MARKET_COUNT)
     }
 
+    /// Returns the configured per-creator market limit, or the finite default if unset.
+    pub fn get_creator_market_limit(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::CreatorMarketLimit)
+            .unwrap_or(DEFAULT_MAX_MARKETS_PER_CREATOR)
+    }
+
     fn assert_market_limit(env: &Env) {
         let counter: u32 = env
             .storage()
@@ -893,6 +909,17 @@ impl MarketsContract {
 
         if counter >= limit {
             panic_with_error!(env, ContractError::MarketLimitReached);
+        }
+    }
+
+    fn assert_creator_market_limit(env: &Env, creator: &Address) {
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::CreatorMarketCounter(creator.clone()))
+            .unwrap_or(0);
+        if count >= Self::get_creator_market_limit(env.clone()) {
+            panic_with_error!(env, ContractError::CreatorMarketLimitReached);
         }
     }
 
@@ -941,6 +968,7 @@ impl MarketsContract {
         creator.require_auth();
 
         Self::assert_market_limit(&env);
+        Self::assert_creator_market_limit(&env, &creator);
 
         if outcome_tags.len() < 2 {
             panic_with_error!(env, ContractError::InvalidConfig);
@@ -962,10 +990,28 @@ impl MarketsContract {
             Some(id) => id,
             None => panic_with_error!(env, ContractError::Overflow),
         };
+        let creator_market_key = DataKey::CreatorMarketCounter(creator.clone());
+        let creator_market_count: u32 = env
+            .storage()
+            .persistent()
+            .get(&creator_market_key)
+            .unwrap_or(0);
+        let new_creator_market_count = match creator_market_count.checked_add(1) {
+            Some(count) => count,
+            None => panic_with_error!(env, ContractError::Overflow),
+        };
 
         env.storage()
             .persistent()
             .set(&DataKey::MarketCounter, &market_id);
+        env.storage()
+            .persistent()
+            .set(&creator_market_key, &new_creator_market_count);
+        env.storage().persistent().extend_ttl(
+            &creator_market_key,
+            MARKET_PAYOUT_CURVE_TTL_LEDGERS,
+            MARKET_PAYOUT_CURVE_TTL_LEDGERS,
+        );
 
         let market = MarketData {
             creator: creator.clone(),
@@ -1912,6 +1958,18 @@ impl MarketsContract {
         env.storage()
             .persistent()
             .set(&DataKey::MarketLimit, &max_market_count);
+    }
+
+    /// Set the maximum number of markets a single creator may create.
+    pub fn set_creator_market_limit(env: Env, admin: Address, max_market_count: u32) {
+        Self::require_initialized(&env);
+        Self::require_admin(&env, &admin);
+        if max_market_count == 0 {
+            panic_with_error!(env, ContractError::InvalidConfig);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::CreatorMarketLimit, &max_market_count);
     }
 
     /// Configures the pause protection parameters (delay and required approvals) (#007).

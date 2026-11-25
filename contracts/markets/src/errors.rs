@@ -68,6 +68,8 @@ pub enum ContractError {
     NotInitialized = 22,
     /// The provided admin address is already present in the admin list.
     AdminAlreadyExists = 23,
+    /// The creator has reached the configured per-address market limit.
+    CreatorMarketLimitReached = 24,
 }
 
 #[cfg(test)]
@@ -99,5 +101,6 @@ mod tests {
         assert_eq!(ContractError::MarketLimitReached as u32, 21);
         assert_eq!(ContractError::NotInitialized as u32, 22);
         assert_eq!(ContractError::AdminAlreadyExists as u32, 23);
+        assert_eq!(ContractError::CreatorMarketLimitReached as u32, 24);
     }
 }

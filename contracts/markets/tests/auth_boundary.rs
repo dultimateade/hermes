@@ -243,6 +243,66 @@ fn test_market_limit_blocks_both_creation_entrypoints() {
 }
 
 #[test]
+fn test_creator_market_limit_is_admin_configurable_and_per_address() {
+    let env = Env::default();
+    let setup = setup_test_environment(&env);
+    env.mock_all_auths();
+
+    assert_eq!(setup.client.get_creator_market_limit(), 100);
+    assert_eq!(
+        setup
+            .client
+            .try_set_creator_market_limit(&setup.unauthorized, &1)
+            .unwrap_err()
+            .unwrap(),
+        ContractError::Unauthorized.into()
+    );
+
+    setup.client.set_creator_market_limit(&setup.admin, &1);
+    assert_eq!(setup.client.get_creator_market_limit(), 1);
+    assert_eq!(create_market_with_auth_check(&setup), 1);
+
+    let question = String::from_str(&env, "Another market?");
+    let description = String::from_str(&env, "Description");
+    let end_time = env.ledger().timestamp() + 86_400;
+    let resolution_source = String::from_str(&env, "Test Source");
+    let outcome_tags = Vec::from_array(
+        &env,
+        [String::from_str(&env, "Yes"), String::from_str(&env, "No")],
+    );
+    let curve = PayoutCurveConfig::winner_takes_all(&env);
+    let over_limit = setup.client.try_create_market_with_curve(
+        &setup.market_creator,
+        &question,
+        &description,
+        &end_time,
+        &resolution_source,
+        &outcome_tags,
+        &curve,
+        &1i128,
+    );
+    assert_eq!(
+        over_limit.unwrap_err().unwrap(),
+        ContractError::CreatorMarketLimitReached.into()
+    );
+    assert_eq!(setup.client.get_market_for_resolution(&2), None);
+
+    let other_creator = setup.user1.clone();
+    assert_eq!(
+        setup.client.create_market(
+            &other_creator,
+            &question,
+            &description,
+            &end_time,
+            &resolution_source,
+            &outcome_tags,
+            &1i128,
+        ),
+        2
+    );
+}
+
+#[test]
 fn test_uninitialized_contract_rejects_admin_actions() {
     let env = Env::default();
     env.mock_all_auths();
